@@ -1,0 +1,35 @@
+* SimpleInliner is the pass used
+
+* inlinehint is the option that "inline" keyword translates to. Its threshold default is higher than the default.
+
+* InlineThreshold
+
+* DefaultThreshold is set with the param we pass from our C code. 
+
+* InlineCost.cpp - inline cost analysis. Has a Threshold member that is set with the DefaultThreshold. It is the upper bound for the inlining cost.
+
+	- allocatedSize - # of statically allocated bytes allocated by callee.
+
+	- NumInstructions
+
+	- NumVectorInstructions
+
+	- // Various magic constants used to adjust heuristics.
+		const int InstrCost = 5;
+		const int IndirectCallThreshold = 100;
+		const int CallPenalty = 25;
+		const int LastCallToStaticBonus = 15000;
+		const int ColdccPenalty = 2000;
+
+	- Accumulates cost for instructions (which often contain costs for running analyses/transforms on these instructions) - this makes complete sense as these costs would have to be incurred if this function has to be inlined.
+
+	- analyzeCall() - 
+
+	- analyzeBlock() - basically a huge ass loop through all instructions in the basic block.
+
+		-- inc instruction counters
+
+		-- visit instructions to get costs
+
+		-- If any non-inlineable trait (or if inlining is discouraged. eg. if caller is a recursive function, we dont want to inline as stack usage my spike..look if the allocatedSize is high enough to determine the very same) was detected on the visit.
+

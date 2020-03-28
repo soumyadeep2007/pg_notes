@@ -1,0 +1,120 @@
+Storage:
+
+smgr:
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+* md is the only storage manager around. The storage manager layer is pure baggage that is gonna stick around.
+
+* smgr.c: delegation to the plugged in storage manager
+
+* md.c: implementation for the smgr interface.
+
+* A single relation is comprised of multiple physical files called forks. FSMs are stored in separate forks. The fork with MAIN_FORKNUM (0) will always be present.
+
+* Functions in smgr.c and md.c take an extra fork number argument, in addition to relfilenode and block number, to identify which relation fork you want to access.
+
+smgr.c:
+--------------------------------------------------
+
+* smgr.c maintains a hashtable of SMgrRelationData objects that are really cached file handles.
+
+* smgrinit() - called during backend startup.
+
+* SMgrRelationData
+	- RelFileNodeBackend smgr_rnode - the key for the hashtable.
+	- SMgrRelationData **smgr_owner - a pointer to this SMgrRelationData from "somewhere else". Used to make smgr unaware of relcache. This pointer is cleared when the relation is closed.
+	- Cache of various block numbers
+		-- current insertion target block
+		-- last known size of fsm fork
+		-- last known size of vm fork
+	- md.c specific fields
+		-- per-fork array of open segments (indexed by forknum)
+		-- per-fork array of segments (indexed by forknum)
+
+* smgropen(rnode, backend) - Get or create a SMgrRelation object. This does NOT open the underlying file?!
+	- Create the hash table if it's non-existent
+	- Lookup the entry and create it if it doesn't exist. Return the entry.
+
+* smgrsetowner(owner, reln) - Establish an owner. Unhook any pre-existent owner.
+
+* smgrclearowner(owner, reln)
+
+* smgrexists(reln, forknum)
+
+* smgrclose(reln)
+	- Iterate through all forks and then close each one by delegating to smgr_close(reln, forknum).
+	- Remove the reln from the hash table.
+	- Unhook owner.
+
+* smgrcloseall() - Call smgrclose(reln) for every reln in the hash table
+
+* smgrclosenode(rnode) - Alternative interface to smgrclose(reln)
+
+* smgrcreate(reln, forknum, isRedo) - Actually create the disk file to be created given a reln and a forknum.
+
+* smgrdounlink(reln, isRedo) - Unlink all forks of a relation.
+	- smgr_close(reln, forknum) for all forknum
+	- Drop all buffers for the relation
+	- Send cache-invalidation message to force other backends to close dangling ownership pointers to SMgrRelns.
+	- Call smgr_unlink(rnode, InvalidForkNumber) to delete the physical file. (InvalidForkNumber designates all forks)
+
+* smgrdounlinkall(relns, nrels, isRedo) - Unlink all forks of all relations passed in.
+
+* smgrextend(reln, forknum, blocknum, buffer, skipFsync) - Similar to smgrwrite(): write at the given position. blocknum is at or beyond the current EOF. Note that writing beyond EOF will not lead to smgr complaining, it will lead to holes of 0-filled pages.
+
+* smgrprefetch(reln, forknum, blocknum) - Initiate an async read of the the specified block of a reln.
+
+* smgrread(reln, forknum, blocknum, buffer) - Read a single block into supplied buffer.
+
+* smgrwrite(reln, forknum, blocknum, buffer, skipFsync) - Used to update already-existing blocks of a relation.
+
+* smgrwriteback(reln, forknum, blocknum, nblocks) - Triggers kernel writeback of page cache for given block. Kernel writeback is marking blocks meant to hit disk as "dirty", to be persisted later.
+
+* smgrnblocks(reln, forknum) - Calculate the number of blocks in the reln. 
+
+* smgrtruncate(reln, forks, nforks, nblocks) - Truncate each fork supplied (can also include vm/fsm) to nblocks each.
+	- Drops buffers for the relfilenode for about-to-be-truncated blocks only. (DropRelFileNodeBuffers(reln->smgr_rnode, forknum, nforks, nblocks);)
+	- Send cache-invalidation message to force other backends to close dangling ownership pointers to SMgrRelns.
+	- smgr_truncate(reln, forknum, nblocks) for each forknum
+	- Update the fsm and vm forks to their updated nblocks if they are present in forks.
+
+* smgrimmedsync(reln, forknum) - Force fsync of fork
+
+* AtEOXact_SMgr() - Close all SMgrRelns at transaction commit/end.
+
+md.c
+----------------------------------------------
+
+* Pools open fds.
+
+* Relations are broken up into segment files of RELSEG_SIZE
+
+* On disk, a relation must consist of consecutively numbered segment files with 0 or more full segments, at most one partial segment and any number of inactive segments of size 0 blocks. The full and partial segments are "active".
+
+* Fds are stored in the per-fork md_seg_fds arrays inside SMgrReln.
+
+* mdextend(reln, forknum, blocknum, buffer, skipFsync)
+	- Find, create and return the segment of the relation holding the blocknum
+	- Write into the fd returned above with the buffer supplied.
+	- Register the segment as an fsync candidate.
+
+
+Access:
+
+relscan:
+
+* RelationData (Relation) - Represents a relcache entry
+	- relfilenode
+	- smgr entry (SMgrRelationData)
+	- FormData_pg_class
+	- tupdesc
+	- rule info
+	- trigger info
+	- part info
+	- index info
+	- reloptions
+	- am info
+	- am cache (general purpose scratch space for am handlers)
+	- stats collection area
+	- toast info
+
+* TableScanDescData {relcache entry, snapshot, flags for scan, parallel scan info}

@@ -1,0 +1,66 @@
+* The IR has 3 equivalent forms:
+	- An in-memory compiler IR
+	- An on-disk bitcode representation
+	- A Human readable form (LLVM Assembly)
+
+* All globals start with @.
+
+* All local variables start with %.
+
+* LLVM views global variables as pointers. So anytime we want to access a global variable, we need to dereference it using a load instruction (read access) or using a store instruction (write access).
+	@globvar = global i32 12, align 4
+	.
+	.
+	.
+	//Inside a function:
+	%2 = load i32, i32* @globvar, align 4
+
+* Local variables:
+	- Register allocated locals: These are temporary and allocated virtual registers.
+
+	- Stack allocated locals: Created by the alloca instruction.
+		-- An alloca returns a pointer to the allocated memory on the stack.
+			%2 = alloca i32 // type of %2 -> i32*
+
+* PHI instruction:
+	- Takes multiple values from different predecessor basic blocks and decides which value to assign depending on the conditional expression.
+
+		define i32 @foo(i32 %a, i32 %b) {
+		entry:
+		  %multmp = mul i32 %a, 16
+		  %cmptmp = icmp ult i32 %multmp, 100
+		  %ifcond = icmp ne i1 %cmptmp, i32 0
+		  br i1 %ifcond, label %then, label %else
+
+		then:                                             ; preds = %entry
+		  %thenaddtmp = add i32 %a, 1
+		  br label %ifcont
+
+		else:                                             ; preds = %entry
+		  %elseaddtmp = add i32 %a, 2
+		  br label %ifcont
+
+		ifcont:                                           ; preds = %else, %then
+		  %iftmp = phi i32 [ %thenaddtmp, %then ], [ %elseaddtmp, %else ]
+		  ret i32 %iftmp
+		}
+
+* Getting the address of an element:
+	- GEP is used to get the address of an element in an aggregate data structure. It only calculates the address but does not access it.
+
+	- getelementptr <base_type> <base_ptr> [<index>,]
+
+	- For a struct, if we want to access the nth element of it, we would have to say:
+		getelementptr <struct type> <struct start ptr> 0, n
+		Here 0 implies we are pointing to the very first struct.
+		This argument is often 0 in most cases.
+
+* Load:
+	- %val = load i32, i32* a1 // load the value at address a1 into val.
+
+* Store:
+	- Write to a memory location:
+
+		store i32 3, i32* %addr
+
+	- Has no return value.

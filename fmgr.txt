@@ -1,0 +1,194 @@
+Function Manager
+
+* V1 Function manager interface:
+
+	- Core data structures:
+
+		-- Result of a function lookup
+
+		-- Params passed to a function call
+
+	- Function lookup is done once per query and NOT per tuple (i.e. function invocation)
+
+	- Function lookup (in pg_proc) result: FmgrInfo
+
+		> PGFunction fn_addr // typedef Datum (*PGFunction) (FunctionCallInfo fcinfo);
+
+		> fn_oid // oid of function (NOT of handler)
+
+		> fn_nargs // number of i/p args
+
+		> fn_strict
+
+		> fn_retset // does function return a set (over multiple calls)?
+
+		> fn_stats // collect stats if track_functions > fn_stats
+
+		> void *fn_extra // scratch space for handler
+
+		> fn_mcxt // Memory context to store fn_extra
+
+		> Node *fn_expr // Expression parse tree for call, or NULL
+
+		-- For an ordinary built-in function, fn_addr is the address of the C routine that implements the function.
+		Else, it is the address of a handler for the class of the given function.
+
+		-- A handler can use fn_oid and/or fn_extra to figure out the code to execute.
+
+		-- fn_oid = InvalidOid indicates that the FmgrInfo hasn't yet been inited.
+
+		-- Most of the above values come from pg_proc, except for fn_extra which is always filled out by the handler.
+
+		-- If the function being called is part of a SQL expression, fn_expr will point to the expression parse tree for the function call, which can be used to extract parse-time knowledge about the params.
+
+	- FunctionCallInfo: struct passed to the function during a call:
+
+		> FmgrInfo *flinfo // lookup info pointer
+
+		> Node *context // Info about call context
+
+		> Node *resultInfo // Pass/return extra info about result
+
+		> Oid fncollation // collation for function to use
+
+		> isnull // is result null?
+
+		> nargs // number of args ACTUALLY passed
+
+		> NullableDatum args[]; // args ACTUALLY passed
+
+		-- flinfo would be ignored by most functions. Handlers would need to use this field.
+
+		-- context is NULL for an ordinary function call but may contain info in certain situations (such as triggers). The type of context passed will be indicated by the type of Node.
+
+		-- resultInfo is NULL when calling a function from which a simple Datum is expected. It may be a subtype of Node otherwise (for eg in the case of an SRF).
+
+		-- args[] is generic. Thus callers and callees have to convert each arg into the right type using the Datum conversion functions.
+
+		-- For a variadic function, nargs will be completely ignored by the callee and the args[] will be pulled out of.
+
+	- Functions (handlers too) will have signature: typedef Datum (*PGFunction) (FunctionCallInfo fcinfo);
+	They will effectively look like: 
+
+		Datum
+		function_name(PG_FUNCTION_ARGS) // PG_FUNCTION_ARGS = FunctionCallInfo fcinfo to help scripts id functions..
+		{
+			...
+		}
+
+	- A non-strict function is tasked to check if any of its arguments are null.
+
+	- Any function can return null. PG_RETURN_NULL() => { fcinfo->isnull = true; return (Datum) 0; }
+
+	- Non-null values are returned with a PG_RETURN_XXX macro of the appropriate type. For example, PG_RETURN_INT32 expands to return Int32GetDatum(x)
+
+* fmgr.h/fmgr.c/fmgrtab.h/dfmgr.c:
+
+	- LOCAL_FCINFO(name, nargs) - Ensures that 'name' points to a stack-allocated FCInfo struct.
+
+	- fmgr_info(functionOid, *finfo) - Fills a FmgrInfo object, given the oid of the function.
+
+		-- Delegates to fmgr_info_cxt_security(functionOid, *finfo, mcxt, ignore_security)
+
+			--- If the function is a built-in: fmgr_isbuiltin(functionOid) will return the FmgrBuiltin struct. Use it to populate finfo. Return
+
+			--- Otherwise:
+
+				---- We need to fetch the pg_proc entry for functionOid. So do a syscache lookup.
+
+				---- Do some security specific stuff
+
+				---- Depending on the language of the function, lookup up FmgrInfo for function and fill in finfo->fn_addr:
+
+					----- If function is internal, we end up here only in an extreme circumstance (as the built-in step above should have worked) - such as user has done a CREATE FUNCTION to create an alias for a built-in. In such a case, we lookup the built-in by the prosrc field: fmgr_lookupByName(prosrc)
+
+					----- If function is a C function, we call fmgr_info_C_lang(functionOid, *finfo, pgprocTuple)
+
+					----- If function is a SQL function, finfo->fn_addr is set to fmgr_sql, the SQL handler.
+
+					----- If function is of another language, fmgr_info_other_lang(functionOid, *finfo, pgprocTuple) is invoked. 
+
+	- FmgrBuiltin[] - table of built-in functions, i.e. functions that are compiled into the Postgres executable.
+
+		> foid
+
+		> nargs
+
+		> strict
+
+		> retset
+
+		> funcName
+
+		> PGFunction func // function pointer
+
+	- fmgr_info_C_lang(functionOid, *finfo, pgprocTuple)
+
+		-- Calls CFuncHashTabEntry * lookup_C_func(pgprocTuple) which looks up the external C function in the function hash table.
+
+		-- If the above hash table entry cannot be found:
+
+			--- Fetch prosrc (link symbol) and probin (library filename).
+
+			--- load_external_function(probin, prosrc, .., *libhandle)
+
+				---- Load the shared lib, unless we already did: internal_load_library(probin) and obtain the library handle. Populate o/p param libhandle.
+
+				---- Lookup and return the function in the loaded lib with dlsym(lib_handle, func_name). Here func_name = prosrc.
+
+			--- Fetch function's info record using fetch_finfo_record(libhandle, prosrc).
+
+				---- Look up pg_finfo_%s() for passed in funcname.
+
+				---- Call the function obtained and return the returned Pg_finfo_record after some validation.
+
+			--- Call record_C_func(pgprocTuple, func_ptr, inforec) to create a CFuncHashTabEntry and to cache the function in the hashtable.
+
+	- fmgr_info_other_lang(functionOid, *finfo, pgprocTuple)
+
+		-- Using the pgprocTuple, lookup pg_language tuple.
+
+		-- Recursively call fmgr_info_cxt_security(lang->lanplcallfoid, &pl_finfo, ..) and populate finfo->fn_addr = pl_finfo.fn_addr
+		lanplcallfoid: Language's call handler()
+
+
+	- CFuncHashTabEntry: represents a hashtable for fast lookup of EXTERNAL C functions (HTAB *CFuncHash)
+
+		> fn_oid // key
+
+		> fn_xmin // for checking if the function is up to date
+
+		> fn_tid
+
+		> PGFunction user_fn // Function pointer
+
+		> Pg_finfo_record *inforec // info record (which just contains an API version)
+
+	- internal_load_library(libname)
+
+		- Check list of loaded files, links, symlinks etc. and if found return the pg_dl* handle to the file.
+
+		- If it is not found:
+
+			-- Create a DynamicFileList and populate it with the file handle returned from dlopen(libname, ..)
+
+			-- Check magic struct compatibility. If not compatible dlclose(libname)
+
+			-- If the lib has has a PG_init(), call it.
+
+			-- Return the file handle.
+
+	- DynamicFileList
+
+		> next
+
+		> device
+
+		> inode
+
+		> handle
+
+		> filename
+
+	- fmgr_symbol(functionOid, **mod, **fn) - Returns module/lib (probin) and C function name (prosrc) for functionOid. 
+		-- If it is SQL function, "fmgr_sql", NULL is returned.

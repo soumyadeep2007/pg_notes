@@ -1,0 +1,341 @@
+–Executor Notes:
+
+* The plan tree is a demand-pull pipeline of tuple processing operations.
+
+* Each node, when called, will produce the next tuple in its output sequence, or NULL if no more tuples are available.
+
+* Scan direction can be chosen : forwards/backwards; not widely supported for non-primitive-scan nodes such as joins, aggregates etc.
+
+* Rescan command can be applied on a node and it will force the node to regenerate its o/p sequence again.
+
+* Parameters: Can alter a node's results -> once a param value is adjusted, the rescan command must be applied to that node and all of the nodes ABOVE it.
+
+* I/U/D: 
+	- For I/U/D the top-level node is a ModifyTable plan node.
+
+	- If there is a returning clause, the ModifyTable node has o/p.
+
+	- For inserts, the tuples returned from the plan tree below ModifyTable are inserted into the table
+
+	- For update, the plan tree returns the computed tuples to be updated, plus a junk ("hidden") CTID column that points to the row that is to be replaced.
+
+	- For delete, the plan tree only needs to deliver a CTID columnm and the ModifyTable node visits each of these rows and marks each row deleted.
+
+* Plan trees and state trees:
+	- The plan tree delivered by the planner contains Nodes of struct Plan.
+
+	- During executor startup, a parallel tree is built which contains executor state nodes.
+		-- Every plan node has an equivalent executor state node.
+
+		-- Each executor state node has a pointer to its equivalent plan node.
+
+		-- This allows for the plan node to be read-only, critical for plan caching.
+
+		-- A corresponding executor node can be omitted by the executor, if partition pruning is involved. This behavior is currently observable with Append and MergeAppend nodes. In this case, the executor state's subnode array will become out of sync with the plan's subplan list.
+
+	- Each Plan node may have expression trees associated with it, to represent its target list or quals.
+		-- These trees are also read-only to the executor.
+
+		-- The executor does NOT create a parallel expression tree for every expression tree that a Plan node may have. Instead, there is just one ExprState node per expression tree (it can have subnodes though).
+
+	- There is a total of 4 node types involved here: Plan<->PlanState, Expr<->ExprState.
+
+* Expression Trees and ExprState nodes:
+	- An ExprState node, which represents an expression tree, enables evaluation of the expression in a compact, linear form (ExprState->steps[], where a step is represented by an ExprEvalStep)
+
+	- Why the array structure?
+		-- Expr trees are so shallow, the overhead involved in traversing the tree is felt.
+
+		-- No recursion required and consequently doesn't increase stack depth as the entire evaluation is done inside a single function call.
+
+		-- The representation is usable for both interpreted and compiled evaluation.
+
+	- The plan tree representation of an expression, i.e. an Expr is transformed into an ExprState node by calling ExecInitExpr().
+
+	- The onus is on ExecInit* functions to shoulder complexity away from the Exec functions in general.
+	ExecInitExpr <->ExecEvalExpr/ExecRunCompiledExpr are no exceptions.
+
+	- Also, inside ExecInitExpr, and probably other ExecInit* functions, we evaluate things that don't need to be executed every time for each tuple. For e.g. finding the set of CHECK constraints that need to be applied.
+
+	- The overall result of the entire expression is populated in ExprState->{resvalue, resnull} fields.
+
+	- Expression initialization:
+		-- During ExecInitExpr() and similar routines, Expr trees are converted into the steps[].
+
+		-- Each step's work is determined by its opcode (ExprEvalOp) and it stores the result of its work in resvalue/resnull.
+
+		-- Complex expressions are performed by chaining together several steps. Eg: "a + b" is one OpExpr and two Var expressions. This is represented as two steps to fetch the var values and the one step for the evaluation of the function underlying the + operator. The steps for the vars would have their resvalue/resnull pointing to the FunctionCallInfoBaseData->{args[].value, args[].isnull} elements, thus avoiding the need to copy data between steps. This is an example of chaining.
+
+		-- The last entry in a completed steps array is always an EEOP_DONE step -> removes the need for testing an end-of-array.
+
+		-- If the expression contains any variable references (to user columns of the ExprContext's INNER, OUTER or SCAN tuples), the steps array begins with EEOP_*_FETCHSOME steps that ensure that the relevant tuples have been deconstructed to make the required columns directly available. Var fetches can thus be simple array lookups.
+
+		-- ExecInitExprRec()
+			--- ExecInitExprRec() is the utility function that does the heavy lifting - it turns each Expr node into an ExprState->steps[], recursing into sub-expressions as is necessary.
+
+			--- Each ExecInitExprRec() call has to specify where the sub-expression's results are to be stored (via resvalue/resnull)
+
+			--- ExecInitExprRec() pushes new operations into the ExprState->steps[] using ExprEvalPushStep(), which repallocs the [] as necessary. Because of this repallocing a step's res{value, null} fields CANNOT refer to other steps. Usually, they refer to memory outside the steps[]. For e.g. the memory for a function call step, i.e. FunctionCallInfoBaseData is allocated separately from the ExprEvalStep.
+
+			-- Some steps, such as boolean expressions, allow skipping the evaluation of certain sub-expressions. In the steps[], this amounts tp jumping to some later step. The jump target is represented as an index in the steps[].
+
+			-- To account for the possibility of jumping, ExecInitExprRec() has to push a jump step into the steps[], recursively generate steps for the sub-expression that may be stepped over, return with the now known length of the steps generated for the skippable sub-expression, and then calculate the jump target appropriately. (Refer to adjust_jumps)
+
+		-- The last step in constructing an ExprState is to call ExecReadyExpr(), which readies the expression for either expression compilation/interpretation.
+
+* Expression Evaluation:
+	- To allow for different methods of expression evaluation, and for better branch/jump target prediction, expressions are evaluated by calling ExprState->evalfunc (via ExecEvalExpr() and friends)
+
+	- ExecReadyExpr() can choose the method of selecting the evalfunc to either reflect:
+		i. JIT compiled function for the expression (it will actually call jit_compile_expr() which will compile the function and set it)
+
+		ii. Special purpose evalfunc for simple expressions (ExecJust*) - for very simple expressions the cost of full interpreter startup can be significant and can be avoided with these functions.
+
+		iii. ExecInterpExpr() which is the default interpreted execution function.
+
+	- A lot of the complex expression evaluation steps, which are less performance critical than the simpler ones, are implemented as separate functions outside the fast-path of expression execution.
+
+		-- This allows their implementaion to be shared across interpretation/compilation.
+
+		-- This implies that these functions cannot perform expression step dispatch themselves, as the dispatch method will vary based on the caller. The dispatch will be performed after the function returns.
+
+		-- These functions also are not allowed to call for the evaluation of sub-expressions. All sub-expression results must have been already computed by earlier steps.
+
+* Targetlist evaluation:
+	- ExecBuildProjectionInfo builds an ExprState that effectively evaluates a targetlist into ExprState->resultslot.
+		-- A generic targetlist expr is executed by evaluating the expression as usual, with the ExprState's resvalue/resnull fields being populated.
+
+		-- Then, with a EEOP_ASSIGN_TMP step, the resvalue/resnull fields are moved to the resultslot's tts_values[], tts_isnulls[].
+
+		-- There are special fast-path steps (EEOP_ASSIGN_*_VAR) to handle targetlist entries that are simple Vars using only one step instead of the two described above.
+
+* Memory management:
+	- A "per query" memory context is created during CreateExecutorState().
+
+	- Any storage allocated during an executor invocation goes there.
+
+	- This allows for easy reclamation of the storage upon executor shutdown by destroying this memory context. We don't have to deal with pfrees piecemeal.
+
+	- The plan state trees and expression states are allocated in this per-query memory context.
+
+	- While processing the query, tuple by tuple, a "per tuple" memory context is used
+		-- They are reset to empty once per tuple.
+
+		-- They are usually associated with ExprContexts, which are further associated to PlanState nodes, which need them to evaluate their quals/targetlists.
+
+* Executor control flow (for queries having a plan tree):
+	CreateQueryDesc
+
+	ExecutorStart
+		CreateExecutorState
+			creates per-query context
+		switch to per-query context to run ExecInitNode
+		AfterTriggerBeginQuery
+		ExecInitNode --- recursively scans plan tree
+			ExecInitNode
+				recurse into subsidiary nodes
+			CreateExprContext
+				creates per-tuple context
+			ExecInitExpr
+
+	ExecutorRun
+		ExecProcNode --- recursively called in per-query context
+			ExecEvalExpr --- called in per-tuple context
+			ResetExprContext --- to free memory
+
+	ExecutorFinish
+		ExecPostprocessPlan --- run any unfinished ModifyTable nodes
+		AfterTriggerEndQuery
+
+	ExecutorEnd
+		ExecEndNode --- recursively releases resources (close relations, drop pins)
+		FreeExecutorState
+			frees per-query context and child contexts
+
+	FreeQueryDesc
+
+* Executor control flow (for queries NOT having a plan tree - simple queries with no aggs, no sub-selects etc.):
+
+	CreateExecutorState
+		creates per-query context
+
+	CreateExprContext	-- or use GetPerTupleExprContext(estate)
+		creates per-tuple context
+
+	ExecPrepareExpr
+		temporarily switch to per-query context
+		run the expression through expression_planner
+		ExecInitExpr
+
+	Repeatedly do:
+		ExecEvalExprSwitchContext
+			ExecEvalExpr --- called in per-tuple context
+		ResetExprContext --- to free memory
+
+	FreeExecutorState
+		frees per-query context, as well as ExprContext
+		(a separate FreeExprContext call is not necessary)
+
+
+* struct QueryDesc:
+
+	> CmdType operation // CMD_SELECT, CMD_UPDATE etc.
+	> PlannedStmt plannedStmt // o/p of planner
+	> sourceText
+	> snapshot info
+	> QueryEnvironment // list of rels
+	> params
+-------------------set by ExecutorStart-----------------------------
+	> tupDesc // desc of result tuples
+	> estate // executor's query wide state
+	> planState // parallel tree to Plan tree constructed by executor
+-------------------set by ExecutorStart-----------------------------
+	> alreadyExecuted
+	> instrumentation - totaltime, options
+
+* execMain.c: External interface to the executor.
+	- ExecutorStart(queryDesc) - delegates to hook/non-hook (standard_ExecutorStart)
+		standard_ExecutorStart:
+			-- Bunch of up-front checks
+
+			-- CreateExecutorState()
+				--- Creates the per-query memory context ("ExecutorState").
+				
+				--- Inits the EState for the query in this memory context.
+
+			-- Copy in fields of the estate created (queryDesc->estate) from the queryDesc.
+
+			-- InitPlan(queryDesc, eflags)
+				--- Permission checks
+
+				--- ExecInitRangeTable(estate, plannedStmt->rangeTable): sets estate->{es_range_table, es_relations..}
+
+				--- Init ResultRelInfos for every relation in plannedStmt->resultRelations if there are any.
+
+				--- Build the ExecRowMark array from the PlanRowark(s) if any.
+
+				--- Init private state for each SubPlan (i.e. all the nodes in the SubPlan) by calling ExecInitNode(subplan, estate, flags) and store the returned PlanState in estate->es_subplanstates.
+
+				--- Init all nodes for the query tree: ExecInitNode(plannedStmt->planTree, estate, eflags) and populate queryDesc->tupDesc with the result.
+
+				--- ExecGetResultType(planState) to populate queryDesc->tupDesc.
+
+				--- If the query is a select query, determine if it needs a junkFilter and init one if.
+
+	- ExecutorRun(queryDesc, direction, count, executeOnce) - delegates to hook/non-hook (standard_ExecutorRun)
+		standard_ExecutorRun:
+			-- We retrieve upto "count" tuples in the specified direction. count = 0 => unlimited
+
+			-- Startup instrumentation and tuple receiver if we are going to be sending tuples.
+
+			-- Call ExecutePlan(estate, queryDesc->{planState, ..}) if there is a valid scan direction.
+				--- Infinite loop until we have all the tuples from the plan's execution.
+					---- Reset per tuple memory context.
+
+					---- Call ExecProcNode(planState) to execute the plan once and obtain a tuple. Store it in "slot".
+
+					---- If we have obtained a null tuple, break from loop.
+
+					---- If we have a junk filter, then project a new tuple with the junk removed. Call ExecFilterJunk(estate->es_junkFilter, slot) to do so.
+
+					---- Send the tuple over. If we are unable to do so, break.
+
+					---- Count tuples and check if we have met requested count (exception: if expected count is 0). If we have met the expected count, break.
+
+				--- Call ExecShutDownNode(planState) if the we don't need a backward scan.
+
+				--- Exit parallel mode if applicable.
+
+			-- Shutdown the tuple receiver and tear down instrumentation.
+
+	- ExecutorEnd(queryDesc) - delegates to hook/non-hook (standard_ExecutorEnd)
+		standard_ExecutorEnd:
+			-- ExecEndPlan(queryDesc->planState, estate)
+				--- Call ExecEndNode() on the passed in PlanState and any SubPlans  : delegates to a ExecEnd* function for the specific node type.
+
+				--- ExecResetTupleTable(estate->es_tupleTable) to destroy the tuple table.
+
+				--- Close estate->es_result_relations and their indices.
+
+				--- Close range table entries with table_close()
+
+				--- Clean up trigger state.
+
+* execProcnode.c - contains dispatch functions that call the appropriate "initialize" (ExecInit*), "get a tuple" (Exec*) and "cleanup" (ExecEnd*) functions for the given node type.
+	- ExecInitNode(planNode, estate, eflags) will call based on the node type, the corresponding ExecInit* function, which may in turn, recursively invoke ExecInitNode() on any of it's sub-nodes.
+		-- A call to ExecInitNode() on the root of the plan tree guarantees that the executor state tree is constructed and each PlanState node in that tree is populated with steps[].
+
+	- ExecProcNode() and ExecEndNode() work similarly as ExecInitNode().
+
+
+* execExpr.c
+	- ExecInitExpr(Expr *node, PlanState *parent): Preps an expression tree for execution given the root node of the expression tree and the parent PlanState node that owns the expression.
+		-- Builds an ExprState for the given tree(subtree) specified by node.
+
+		-- Since the Expr tree is R/O, it can be used across parallel processes. However, ExprState is NOT.
+
+		-- The ExprState created must be allocated in a memory context that will be around for all the repeated evaluations of the expression. Typically, such a memory context is the per-query context.
+
+		-- Any Aggref, WindowFunc or SubPlan nodes discovered during the process of traversing the Expr tree, will be added to the corresponding parent PlanState fields.
+
+		-- We init an ExprState.
+
+		-- Call ExecInitExprSlots(exprState, node) - adds expression steps for deforming the ExprState's inner/outer/scan slots as much as required by the expression.
+			--- First, compute which attributes are going to be deformed.
+
+			--- Then add the deform steps: call ExecPushExprSlots().
+
+		-- Call ExecInitExprRec(node, state, state->resvalue, state->resnull) to populate the steps[].
+
+		-- Append a DONE step.
+
+		-- Call ExecReadyExpr(exprState) to set up interpeted/compiled evaluation.
+
+	- ExecInitExprRec(Expr *node, ExprState *state, Datum *resv, bool *resnull)
+		-- Appends the steps necessary for the evaluation of the expression represented by node to state->steps[], possibly by recursing into sub-expressions of nodes.
+
+		-- Depending on the type of node, in a humongous switch, do the following (general steps - all of them may not be necessary depending on the node type):
+			--- Do some kind of ExecInit* operation
+
+			--- Push step(s).
+
+			--- Recursively call ExecInitExprRec.
+
+
+* Interpreted expression evaluation (execExprInterp.c: ExecInterpExpr()):
+	- "Direct threaded" (gcc, clang and compatible) or "switch threaded" (all compilers) implementations available.
+
+	- For both the implementations, ExprEvalStep->opcode is used to perform the dispatch to the code block handling the opcode.
+
+	- Switch-threading uses a simple C switch statement.
+		-- Disadvantages:
+			--- Dispatches occur from the same location => more jumps, worse branch prediction.
+
+	- Direct threaded implementation:
+		-- It is one of the fastest known methods of interpreted evaluation without having to resort to assembly level tactics.
+		
+		-- It needs support for computed GOTOs.
+
+		-- Direct threading uses gcc's label-as-values extension to replace ExprEvalStep->opcode with the address of the code block implementing the instruction.
+
+		-- The ExprState's flags would contain EEO_FLAG_DIRECT_THREADED
+
+		-- Dispatch to the next code block is done with the help of a computed goto.
+
+		-- This implies better branch prediction (as jumps happen from different sources).
+
+		-- Fewer jumps are also required as there is no preparatory jump to a common dispatch location.
+
+		-- ExprState flags will contain EEO_FLAG_DIRECT_THREADED to indicate that this is a direct threaded dispatch.
+
+	- Complex or uncommon instructions are NOT implemented inline inside ExecInterpExpr(). They are implemented as heler functions.
+		- Why?
+			-- There won't be a noticeable performance gain.
+
+			-- Also these routines can now be used by compiled evaluation as well. This is why they are externed.
+
+* JITed expression evaluation:
+
+
+
+

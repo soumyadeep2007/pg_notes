@@ -1,0 +1,854 @@
+Notes:
+
+* Zedstore TIDS are purely logical and the executor is fooled by Zedstore to thinking that they are actual TIDs.
+
+* TID tree: Leaf pages consist of ZSTidArrayItems, each of which represents a non-overlapping TID range.
+
+* Having a TID tree that's separate from the attributes helps to support
+zero column tables (which can be result of ADD COLUMN DROP COLUMN actions
+as well). Plus, having meta-data stored separately from data, helps to get
+better compression ratios. And also helps to simplify the overall
+design/implementation as for deletes just need to edit the TID tree
+and avoid touching the attribute btrees.
+
+* Attribute tree: Leaf pages consist of two streams: one compressed_lz4 (upper) and uncompressed (lower) stream. 
+
+* Why two streams? Faster appends..if they can be accommodated do so, compress later. Also, older and relatively lesser important data would end up in the compressed section.
+
+* When new rows are added, the new attribute data is
+appended to the uncompressed stream, until the page gets full, at which
+point all the uncompressed data is repacked and moved to the compressed
+stream (a "merge").
+
+* An attribute stream is composed of "chunks", with each chunk containing TIDs and associated tuple column values for upto 1-60 tuples. Each attribute stream can be thought as storing a sequence of TIDs. These TIDs never overlap. They are also not guaranteed to be consecutive -> there may be holes? (Probably a vacuum leads to that..)
+
+* Since TIDs in ZS are logical, we can move tuples around freely, specially during page splits.
+
+* Uncompression is done
+on-the-fly, as and when needed in backend-private memory, when
+reading.
+
+* For some compressions like rel encoding or delta encoding
+tuples can be constructed directly from compressed data.
+
+* To reconstruct a row with given TID, scan descends down the B-trees for
+all the columns using that TID, and fetches all attributes. Likewise, a
+sequential scan walks all the B-trees in lockstep.
+
+* A metapage at block 0, has links to the roots of the B-trees.
+
+* Every page has a page type ID,
+  which indicates what kind of a page it is.
+
+* For a B-tree page,
+  the page header contains the attribute number and lo/hi key.
+  That is enough information to find the downlink to the page, so
+  that it can be deleted if necessary.
+
+* There is enough information
+  on each leaf page to easily re-build the internal pages from
+  scratch, in case of corruption, for example.
+
+* zedstore has undo pointer with each item directly (in the TID leaf page). In case
+of bulk load the undo record pointer is maintained for array of items
+and not per item.
+
+* TOAST: For an oversized datum -> it is broken into chunks and these chunks are stored on a dedicated toast page (toast pages are maintained as a doubly linked list) WITHIN the same physical file.
+
+* Select: New table AM API was required -> whether we have a projection associated with a sequential scan..This is of course crucial -> since this is the best use case for zedstore storage..i.e. column projection without a filter.
+
+* Delete: UNDO record created -> TID tree item is updated with new UNDO pointer -> NO attribute tree is touched.
+
+* Update: Delete -> Insert.. No in-place update. Is this something we want to pursue?
+
+* Indexing: Index builds only require a scan of associated attribute tree(s). TIDs are the values of an index.
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+zedstore_internal.h
+---------------------------
+
+* Opaque page special area for every kind of page
+
+* attstream_buffer: In-mem representation of an attribute stream.
+
+* attstream_decoder: attstream -> (tids, datums, isnulls). Has a buffer to store the "current attstream" being decoded.
+
+* ZSBtreePageOpaque: Has generic B-tree data structure maintenance info: key limits, a next "BlockNumber"?
+
+* ZSAttStream {size, flags, payload size, lasttid, payload}: Denotes an attribute stream -> either lower/upper.
+
+* Structure of attribute tree leaf page:
++--------------------+
+| PageHeaderData     |
++--------------------+
+| lower attstream    |
+| (uncompressed) ... |
+| .................. |
+| .................. |
++--------------------+ <-pd_lower
+|                    |
+|    (free space)    |
+|                    |
++--------------------+ <-pd_upper
+| upper attstream    |
+| (compressed) ....  |
+| .................. |
+| .................. |
+| .................. |
++--------------------+ <-pd_special
+| ZSBtreePageOpaque  |
++--------------------+
+
+* ZSTidArrayItem: Leaf item of TID tree. Has tids in : [t_firsttid, t_endtid - 1]
+Structure of an item: Header  |  1-16 TID codewords (Simple 8-b) | 0-2 UNDO pointers | UNDO "slotwords"
+TODO: fill this with info on UNDO slots....
+
+* ZSToastPageOpaque and varatt_zs_toastptr
+
+* 
+typedef struct ZSRootDirItem
+{
+	BlockNumber root;
+} ZSRootDirItem;
+
+typedef struct ZSMetaPage
+{
+	int			nattributes;
+	ZSRootDirItem tree_root_dir[FLEXIBLE_ARRAY_MEMBER];	/* one for each attribute */
+} ZSMetaPage;
+
+* ZSMetaPageOpaque - undo list pointers, head of free page map, 
+
+* ZSUndoSlotVisibility - xmin, xmax, cmin.....
+
+* ZSTidItemIterator
+
+* ZSTidTreeScan - scan state for scanning the TID tree between starttid and endtid.
+
+* ZSAttrTreeScan - Does not have the TID???
+
+* ZSMetaCacheData - The cache contains the block numbers of the roots of all the tree
+structures, for quick searches, as well as the rightmost leaf page, for
+quick insertions to the end.
+
+* zs_split_stack {next, buf, page, recycle, special_only} - It is used during page split, or page merge, to keep track
+of all the modified pages. The page split (or merge) routines don't modify pages directly, but they construct a list of 'zs_split_stack' entries.
+
+* ZedstoreTupleTableSlot - "materialized" data (an opaque byte array) with ZSUndoSlotVisibility info.
+
+* ZSTidArrayItemDecode(item, codewords, slots, slotwords) - Decodes passed in ZSTidArrayItem into passed in space for codewords, slots and slotwords.
+
+zedstore_tupslot.c
+--------------------------
+
+* Contains the TTSOps for a ZedstoreTupleTableSlot.
+
+* tts_zedstore_getsomeattrs -> not supported.
+
+* tts_zedstore_getsysattr -> only supports peeking into the xmin.
+
+* tts_zedstore_materialize -> Datums that aren't passed by value need to be "materialized" into the ZedstoreTupleTableSlot->data member.
+
+* tts_zedstore_copy_{heap, minimal}_tuple -> It is possible to form a heap tuple from a zedstore tuple.
+
+
+zedstore_tuplebuffer.c
+---------------------------
+
+* For buffering inserts into a zedstore table. Needs more comments.
+
+* attbuffer: buffers tids, datums and isnulls along with a staging area for chunks?
+
+* tuplebuffer: Composed of attbuffers. Has infrastructure for pre-allocating tids: reserved_tids_XXX
+
+* zsbt_tuplebuffer_allocate_tid - 
+
+
+zedstore_btree.c
+----------------------------
+* zsbt_descend - Descend a given tree specified by attno (attno = 0 => tid tree) and returns the local buffer/shared buffer (Buffer)
+	- Takes a level argument along with the key. Also can create a tree if readonly = false and the tree is empty. 
+	- Has fast path for finding the rightmost page in the btree. There is a per-rel metacache from which we can find the rightmost key for an attribute.
+	- zsmeta_get_root_for_attribute: Get the relevant root for attno.
+	- Loop to descend the tree (iterate over blocks (i.e. page), the pointers in the tree have block numbers) until we are at the target level:
+		-- zsbt_page_is_expected: Check if we landed on a page that is undergoing a concurrency op. (Can't we lock this stuff?) Sanity check: Under no circumstance during our walk should we come across a page whose lowest tid is greater than the tid we are searching. If we landed on an unexpected page, we restart the search.
+		-- zsbt_binsrch_internal on the current page with the key to find the next pointer (block..i.e. page)
+
+* zsbt_find_and_lock_leaf_containing_tid -
+	- very weird interface. If you pass it a valid buffer for a leaf page and the tid is within the bounds of the page, it will return the same buffer. If you pass it a valid buffer for a leaf page but it doesn't contain the key then it will apply an optimization: it will try to see if the buffer is for a leaf page that contains tid - 1. If it does, then the page's next pointer will give us the desired page (of course we have to ensure that the resulting block contains what we are looking for..step in the retry logic). If you pass in an invalid buffer to begin with it will do a zsbt_descend (which does lock the buffer before returning it).
+
+* zsbt_insert_downlinks(rel, attno, leftlokey, leftblkno, level, downlinks) - TODO: wrong comment.
+	- Find parent to insert downlinks into by descending the tree (zsbt_descend)..'parentbuf'
+	- Perform a binary search on the internal page items with the first downlink's tid to get the "itemno" offset.
+	- If we don't have enough space for the downlinks, we split the internal page. (zsbt_split_internal_page) and capture the result in split_stack.
+	- Else:
+		-- Allocate a new page and create a stack entry for it. This is the page which will have the updated downlinks array.
+		-- Insert the downlinks starting at "itemno".
+		-- Update the pd_lower of the new page to reflect the inserted downlinks.
+	- Return split_stack (will be null if the downlinks could be inserted without needing to split).
+
+* zsbt_newroot(rel, attno, level, downlinks) - Creates a new btree root page containing two downlinks.
+	- We need to pass in the level argument as the level for the root is not 0 and is thus dynamic.
+	- This is not the call site when we are constructing the initial root of an attribute tree. That is done in zsmeta_get_root_for_attribute().
+	- Allocate a new page for the root with tid range [MinZSTid, MaxPlusOneZSTid).
+	- Insert the two downlinks.
+	- Update the meta page to reflect the new root.
+	- Return: |stack_entry_new_root| -> |stack_entry_meta_page|
+
+* zsbt_split_internal_page(rel, attno, origbuf, newoff, newitems)
+	- Make a copy of the original page's special (this of course does not copy over the items).
+	- We always do a 90-10 split currently.
+	- In the copied page copy over the items from the page being split until we reach the offset where we are to insert 'newitems', the downlinks to be inserted into the page. Then copy over the new items. Then copy the rest of the items from the original page. If at any point in this process, the copy runs out of space, we split the copy of the page (put the copy of the new page on the stack, then create a new page, update the bounds of the copy, create a downlink for the copy)
+	- If we had to split (may have been more than once) then we have to insert the downlinks. Might have to create a new root if origbuf was a root, otherwise we just have to call zsbt_insert_downlinks(). 
+	- Returns the head of the stack (will always start with the first copy and will have more entries if the copy had to be split further).
+
+* zs_apply_split_changes(rel, stack, undo_op) - Make modifications to a btree with the contents of stack.
+	- Each stack entry has a page with the changes to be made and a buffer where those changes ought to be reflected.
+	- If wal is needed, do wal stuff.
+	- Loop over the stack entries:
+		-- Depending on if the stack contains pages with ONLY the "special" areas being significant, copy over only the special area or the entire page. Do wal logging if necessary.
+		-- Mark each stack entry's buffer as dirty.
+	- Undo specific stuff
+	- Loop over the stack entries again:
+		-- If the page is meant to go into the FSM, call zspage_delete_page on it.
+
+zedstoream_handler.c
+--------------------------------------
+
+* Table AM implementation for ZedStore
+
+* zedstoream_get_latest_tid(tablescan, tid)
+	- Convert tid (I/O param) into a zstid
+	- Flush tuple buffer for scan's rel.
+	- Call zsbt_find_latest_tid().
+	- Convert the zstid obtained to an ItemPointer and set it to 'tid'.
+
+* zedstoream_insert_internal(rel, slot, cid, speculative)
+	- If it is not a speculative insert, call zsbt_tuplebuffer_allocate_tid(rel, xid, cid) to allocate a tid for the insert: 'tid'.
+	- Else, we call zsbt_tid_multi_insert(rel, ntuples=1, xid, cid, speculative, InvalidUndoPtr) to allocate a tid for the insert:
+	 'tid'.
+	- Materialize slot (call to slot_getallattrs()), i.e. populate values and isnulls array.
+	- Call zsbt_tuplebuffer_spool_tuple(rel, tid, slot's values, slot's isnulls)
+
+* zedstoream_multi_insert(rel, slots, ntuples, cid, ..)
+	- Call zsbt_tid_multi_insert(rel, ntuples, xid, cid, ..) and get the 'firsttid'of the multi-insert.
+	- Form tids, where tid[i] = firsttid + i.
+	- zsbt_tuplebuffer_spool_slots(rel, tids, slots, ntuples)
+	- Populate the tableOid and zstid-converted-to-tid for all slots.
+	- Update stats to register an insert of n tuples.
+
+zedstore_tuplebuffer.c
+--------------------------------------
+
+* For buffering INSERTs to a ZedStore table. Buffers are maintained in a hash table (of 10 elements? initially 10 elements? keyed by table OID. SOME SERIOUS META_PROGRAMMING VOODOO HERE!!! (Refer SH_PREFIX). 
+
+* There is one tuple buffer per relation.
+
+* tuplebuffer: Composed of attbuffers {table_oid (hkey), attbuffer* attbuffers, reservations for tid, xid and cid}
+
+* attbuffer: (Encaps an attstream buffer)
+typedef struct
+{
+	zstid		buffered_tids[60];
+	Datum		buffered_datums[60];
+	bool		buffered_isnulls[60];
+	int			num_buffered_rows;
+
+	attstream_buffer chunks;
+
+} attbuffer;
+
+* get_tuplebuffer(rel) - Find or create (properly initialize all associated attbuffers as well) tuple buffer in the hash table for all tuple buffers. If the tuple buffer is found and if the number of attributes have increased since last time it was stored in the hash table (why would that happen?), then flush the tuple buffer and retry (this is done as a flush of a tuplebuffer implies deletion of the buffer as described below)
+
+* zsbt_tuplebuffer_flush(rel) -
+	- Looks up tuplebuffer in hash table
+	- tuplebuffer_flush_internal(rel, tupbuffer)
+		-- tuplebuffer_kill_unused_reserved_tids(rel, tupbuffer)
+		-- Flushes each attbuffer in a loop
+	- Frees memory for tuple buffer and attbuffers.
+	- Deletes tuple buffer from hash table.
+
+* zsbt_tuplebuffer_allocate_tid(rel, xid, cid) - allocates a TID for an insert.
+	- get_tuplebuffer(rel)
+	- Check if xid and cid match the reserved xid and cid in the tuplebuffer. If it is not a match, that means that either this is for the first insert or it is a different reservation. If it is not a match then reserve the xid and cid in the tuplebuffer.
+	- If we have pre-reserved tids, then consume one of them for the insert. If we don't have pre-reserved tids then depending on whether we will have "many" repeated inserts reserve tids in batch mode (ntuples = TID_RESERVATION_SIZE = 100) or reserve a single tid. This is done by calling zsbt_tid_multi_insert.
+
+* zsbt_tuplebuffer_spool_tuple(rel, tid, datums, isnulls) - Spool a tuple. This has the effect of buffering all of the datums involved in their respective attbuffers before they hit the actual pages. (Q: What are the advantages of this kind of spooling?)
+	- Get the tuplebuffer for the rel.
+	- Loop over all attributes:
+		- Compute datum to insert (may have to toast the datum)
+		- Spool the attbuffer for the attribute. zsbt_attbuffer_spool(rel, attno, attbuffer, ntuples = 1, tid, datum, isnull)
+
+* zsbt_tuplebuffer_spool_slots(rel, tids, slots, ntuples) - Spool a bunch of tuples. The loop ordering is CRUCIAL here!
+	- Fetch the tuplebuffer for rel.
+	- Loop over all attributes:
+		-- Loop over the tuples to build datums/isnulls:
+			--- For the first time ONLY: Materialize slot (call to slot_getallattrs()), i.e. populate values and isnulls array.
+			--- Calculate datum (toast if necessary)
+		-- Spool the attbuffer for the attribute. zsbt_attbuffer_spool(rel, attno, attbuffer, ntuples, tids, datums, isnulls) 
+
+* zsbt_attbuffer_spool(rel, attno, attbuffer, ntuples, tids, datums, isnulls) - Loop through all tuples, buffer the tids, datums and isnulls in the supplied attbuffer (in the buffered_xxx members of the attbuff) in batches of 60 before flushing the attbuffer. Throughout this process, if there is any pass-by-ref datum, we make a copy of the datum (i.e. materialize the datum)
+
+* zsbt_attbuffer_flush(rel, attno, attbuffer, all)
+	- If number of buffered rows exceeds 60 or if "all" is specified, then we append the buffered_{tids, datums, isnulls} to the attstream specified by attbuffer->chunks, by calling append_attstream().
+	Note that due to append_attstream's contract we have no guarantee that all of the datums would be appended successfully to the stream. So we record the number of datums successfully appended.
+	- Memmove the remaining buffered_{tids, datums, isnulls} to be at the beginning of their respective buffers.
+	- Loop until the len and cursor of the attstream_buffer for the attbuffer don't meet
+		-- Call zsbt_attr_add(rel, attno, attbuffer->chunks) which makes sure the datums hit the page(s).
+
+
+zedstore_attstream.c
+-----------------------------------
+
+* Consists of routines for packing datums into "attribute streams" for storage in attribute leaf pages.
+
+* An attribute stream is composed of chunks with each chunk containing the TIDs of 1-60 rows along with the datums.
+
+* Each chunk begins with a 64 bit codeword. The codeword is enough to represent all of the TIDs in the chunk (the TIDs are delta encoded in Simple-8b format). Also, the codewords indicate the presence of  NULLs and for varlena attributes, the width of each Datum.
+
+* The first TID in a stream is an absolute value. It's previous TID is considered to be 0.
+
+* Advantages of the chunked format:
+	- Compact for common case where TIDs are relatively consecutively numbered.
+	- Fast to encode/decode
+	- Streams can be chopped off at any point. If split_chunk = x, we would only have to re-encode the (x + 1)th chunk.
+	- Chunks are small enough to minimize waste during splits.
+	- Two streams can be appended to each other without needing to re-encode the chunks.
+
+* Disadvantages of the chunked format:
+	- Random access by tid is not possible. To access a TID, the stream must be read starting from the beginning.
+* attstream_buffer - An in-memory representation of an attribute stream which is implemented as a resizeable buffer. It doesn't include the ZSAttStreamHeader but has enough information to reconstruct it whenever.
+
+* Decoder:
+	- attstream_decoder
+		-- cxt, tmpcxt
+		-- Attribute metadata - attlen, attbyval
+		-- Some raw byte buffers - chunks_buf, chunks_buf_size
+		-- Current attstream info - chunks_len, firsttid, lasttid
+		-- Next position in attstream - pos, prevtid
+		-- Currently decoded batch - tids, datums, isnulls, num_elements
+
+	- To read an attstream, we have to init a decoder -> load the decoder with data using decode_attstream_begin() -> read the data one chunk at a time using decode_attstream_cont() until it returns false.
+
+	- init_attstream_decoder(decoder, attbyval, attlen) - Sets up decoder struct.
+
+	- decode_attstream_begin(decoder, ZSAttStream)
+		-- Determine buf_size_needed based on whether the stream is compressed.
+		-- Grow decoder's raw byte buffer to meet buf_size_needed.
+		-- If the stream is compressed, decompress the stream's payload into the decoder's buf. Otherwise, memcpy the payload into the decoder's buf.
+		-- Assign firsttid for decoder by looking at the first chunk's first tid by calling get_chunk_first_tid().
+		-- Assign lasttid for decoder by looking at attstream's last tid.
+	- decode_attstream_cont(decoder) - Decodes next chunk set up in the decoder (This comment is a bit dated as it seems to call decode_chunk in a while loop). Returns true if there is more data left in the attstream, false otherwise.
+
+	- decode_chunk_fixed(attbyval, attlen, lasttid, chunk, num_elems, tids, datums, isnulls) - Decodes chunk to fill in tids, datums and isnulls along with lasttid and number of datums(rows) - num_elems. It returns the size of the chunk decoded (i.e. it returns the size of the chunk as it is in encoded form -> decoding doesn't modify the chunk, it is a read operation!). Note that we need to pass it the lasttid of the previous chunk as we need an absolute tid to add the delta tids to. At the end of the call, the lasttid of the decoded chunk will be populated.
+
+* encode_chunk_fixed(attstream_buffer, prevtid, ntids, tids, datums, isnulls) - Encode the supplied batch of elements into the attstream_buffer. 
+	- At every iteration check if the next values will fit into the current scheme of things (current mode). Else, we would have to adopt a wider mode that can hold larger values but can hold lesser values.
+	- It returns the number of items encoded.
+
+
+* Attribute stream manipulation:
+	- attstream_buffer
+		-- data: enlargeable buffer that has the raw chunks
+		-- cursor, len: pointers inside data that delimit the area where chunks are stored. The area outside cursor..len is unused space.
+		-- maxlen
+		-- firsttid, lasttid stored in the buffer
+		-- attribute metadata - attlen, attbyval
+
+	- create_attstream(attstream_buffer, attbyval, attlen, nelems, tids, datums, isnulls) - Encodes tids and datums into a newly initialized attstream struct.
+		-- Lot of struct init, specially first and last tids, data, cursor, len, maxlen etc.
+		-- Encodes each element (tid, datum, isnull) into the attstream by calling encode_chunk
+
+	- append_attstream(attstream_buffer, all, nelems, tids, datums, isnulls) - Append the elements to the attstream.
+		-- Optimization to shuffle things around to make space instead of growing the buffer.
+		-- If len and cursor point to the same spot, the attstream buffer must be empty. Thus, we set the firsttid of the buffer to be tids[0] with prevtid = 0. Else, we set prevtid to be the lasttid of the buffer.
+		-- while more than 60 elements remain or if all is true:
+			-- call encode_chunk repeatedly to encode items into the attstream buffer.
+		-- returns number of elements appended.
+
+	- chop_attstream(attstream_buffer, pos, lasttid) - Trim a stream upto the chunk (from the beginning) that starts at the offset 'pos' from buffer's cursor. It will return the trimmed attstream_buffer with a new absolute first tid: "newfirsttid". Also pass in the lasttid of the chunk before the chunk at "pos".
+		-- Advance cursor by the offset = pos
+		-- If the cursor is at len, return.
+		-- The "first_chunk" is that of the resultant attstream buffer. Similarly newfirsttid is intentioned.
+		-- newfirsttid = lasttid + get_chunk_first_tid(buf->attlen, first_chunk); // lasttid is absolute whereas get_chunk_first_tid would return a relative tid.
+		-- replace_first_tid(attlen, newfirsttid, first_chunk): Try to replace the first tid of the chunk at pos in place. If the in-place update is not successful:
+			--- Decode first_chunk and encode it in a new temporary attstream buffer by calling create_attstream() with the elements obtained from the decoding step.
+			--- Replace the first chunk in the original attstream_buffer as follows:
+							'lcd'
+							|<->|
+				---------------------------------
+				|	|	|	|	|	|	|	|	|
+				---------------------------------
+							^					^
+							(pos)				(len)
+							^
+							(cursor)
+
+				So we decode the chunk starting at pos. 'lcd' is the decoded chunk length. After re-encoding it, say it will have encoded length = 'lce'. Our goal is to copy over the encoded chunk (copy 'lce' bytes) into the original attstream buffer and then adjust cursor to point to the copied over chunk. The example below shows what would happen if lce > lcd. It also shows the final cursor position.
+
+						    'lce'
+						   |<-->|
+							'lcd'
+							|<->|
+				---------------------------------
+				|	|	|  |	|	|	|	|	|
+				---------------------------------
+							^					^
+							(pos)				(len)
+						   ^
+						   (cursor)
+
+	- chop_attstream_at_splittid(oldattbuff, newattbuff, splittid) - Split oldattbuff into oldattbuff and newattbuff such that oldattbuff contains items with tids [oldattbuff.firsttid, splittid] and the newattbuff contains items with tids (splittid, lasttid).
+
+		-- find_attstream_chop_pos_with_tid(oldattbuff, splittid): We find the beginning offset of the chunk that covers splittid.
+		-- Then we decode that chunk with decode_chunk().
+		-- We now attempt to split that decoded chunk into a "left_chunk_XXX" and a "right_chunk_XXX" (find index to the right of splittid and move over XXXs starting from that index into right_chunk_XXX). If we find that the right_chunk_XXXs are empty, we consider the chunk (decoded) following the chunk being split, to be our right_chunk_XXX.
+		-- Create a new "right" attstream starting with the right_chunk_XXX.
+		-- Append the remaining attbuffer (beyond the right chunk) to the new "right" attstream.
+			--- Determine length to enlarge the attstream_buffer by (right_stream_len_to_append).
+			--- memcpy everything from the start of span denoted by right_stream_len_to_append in the diagrams below to the end of the new attstream.
+			-- Diagrams below indicate the original attstream buffer.
+
+			Case 1: splittid (*) is in the middle of a chunk
+
+						split_chunk_len
+							|<->|
+				---------------------------------
+				|	|	|	|	|	|	|	|	|
+				---------------------------------
+							  *
+				^			^					^
+				(cursor)	(split_chunk_pos)	(len)
+								|<-------------->|
+							right_stream_len_to_append
+
+			Case 2: splittid (*) is in boundary of a chunk
+						split_chunk_len
+							|<->|
+				---------------------------------
+				|	|	|	|	|	|	|	|	|
+				---------------------------------
+								*
+				^			^					^
+				(cursor)	(split_chunk_pos)	(len)
+								|<->|
+							right_chunk_len
+									|<--------->|
+							right_stream_len_to_append
+
+		-- We have to truncate everything beyond the * in the diagram above in the original attstream_buffer.
+			--- We first truncate everything beyond split_chunk_pos first. (Move len to split_chunk_pos)
+			--- Then we include the items in between split_chunk_pos and the *. We do that by calling append_attstream(original_attstream_buffer, left_chunk_XXX).
+
+
+	- find_attstream_chop_pos_with_tid(attbuf, splittid, lasttid_prev_chunk) - Find the beginning offset of the last chunk that covers splittid and while doing so, record the lasttid of the chunk previous to the one where we find the splittid.
+		-- We start seeking at the start of the attstream and then we call skip_chunk(.., lasttid) to find the lasttid of the chunk we are iterating over and we continue seeking until we are past the splittid.
+
+	- find_attstream_chop_pos(attbuff, offset, lasttid) - Returns the following offset:
+				---------------------------------
+				|	|	|	|	|	|	|	|	|
+				---------------------------------
+				^			   ^
+				(chunks)	   (len, pend)
+							^
+							(return value)
+
+	- append_attstream_inplace(att, oldstream, freespace, new_attstream_buffer) - Append the new stream buffer to the old stream (ZSAttStream). The pre-condition for this call is that there is "freespace" bytes worth of free space after oldstream. We signal success by returning a boolean. It is used in a critical section
+		-- If the oldstream is compressed we return false. What about new_attstream_buffer? Can it be compressed?
+		-- Check if freespace is enough to accommodate the data in new_attstream_buffer. If not, return false.
+		-- Get the firsttid of the new attstream_buffer "firstnewtid" (TODO: can't we directly use new_attstream_buffer->firsttid?)
+		-- If there is overlap in tids between the oldattstream and the new attstream_buffer return false.
+		-- Now we can truly perform the in-place append
+			--- memcpy to the end of the oldstream the new_attstream_buffer's data.
+			--- We have to turn the firstnewtid into a delta tid, with the delta = oldstream's lasttid - firstnewtid. We do this by calling replace_first_tid(delta, old_end_of_oldstream).
+			--- We update the size of the oldstream and the lasttid.
+			--- We truncate the new_attstream_buffer by setting cursor = len.
+
+	- init_attstream_buffer_from_stream(buf, attbyval, attlen, attstream, memcxt)
+
+	- merge_attstream(att, buf, attstream2) - Merge attstream2 into the attstream_buffer buf. buf represents the resultant attstream_buffer.
+		-- TODO: reword to left_ and right_, add comment.
+		-- Decompress attstream2 if it is compressed into 'decompress_buf'.
+		-- merge_attstream_guts(attr, buf, decompress_buf, decompressed_size_of_attstream2, attstream2's lasttid)
+
+	- merge_attstream_guts(attr, buf, chunks2, chunks2len, lasttid2)
+		-- chunks2 is the decoded attstream's payload.
+		-- Get firsttid2
+		-- If firsttid2 > lasttid1, i.e. the streams don't overlap:
+			--- We enlarge buf by chunks2len.
+			--- We memcpy the decoded attstream's payload 'chunks2' on to the end of buf.
+			--- We replace the firsttid of the starting chunk of the appended section in place. TODO: what happens if an in-place update fails?
+			--- Advance buf->len by chunks2len
+			--- Update buf's lasttid to be the lasttid of the attstream appended: 'lasttid2'.
+			--- Return.
+		-- Else, if the streams do overlap:
+			--- We decode buf and the decoded attstream's payload chunks2 and merge into result_{tids, datums, isnulls}. While we do this, we buffer the result_{} arrays upto 1000 tuples and we append it into the resultant attstream_buffer 'buf'
+
+
+
+
+zedstore_tidpage.c
+----------------------------------
+
+* Operations supported: 
+
+* ZSTidTreeScan - In progress state of a scan of Zedstore TID tree
+	- rel
+	- context
+	- active
+	- lastbuf
+	- lastoff
+	- snapshot
+
+	- starttid
+	- endtid
+	- currtid
+
+	- recent_oldest_undo
+	- acquire_predicate_tuple_locks
+
+	// fields for processing array items in a scan
+	- array_iter (ZSTidItemIterator)
+	- array_curr_idx
+
+* ZSTidArrayItem
+	- t_size
+	- t_num_tids
+	- t_num_codewords
+	- t_num_undo_slots
+
+	- t_firsttid
+	- t_endtid
+
+	- t_payload
+	// UNDO slots and codewords follow.
+
+* ZSTidItemIterator
+	- tids_allocated_size
+	- tids
+	- tid_undoslotnos
+	- num_tids
+	- context
+	- undoslots
+	- undoslot_visibility
+
+* zsbt_tid_begin_scan(rel, starttid, endtid, snap, scan) - Begin a scan of the tid tree by initing the passed in scan struct.
+
+* zsbt_tid_reset_scan(scan, starttid, endtid, currtid) - Reset the scan to the passed in tids
+
+* zsbt_tid_end_scan(scan) - Ends an active scan, frees resources (array_iter), releases scan->lastbuf
+
+* zsbt_tid_scan_extract_array(scan, ZSTidArrayItem aitem) - Helper to extract Datums from the given aitem into the scan's array_* fields.
+
+	- zsbt_tid_item_unpack(aitem, &scan->array_iter)
+
+* zsbt_tid_item_unpack(aitem, iter) - Extract TIDs from an item into an iterator
+	- If the tids_allocated_size of the iterator is not enough for the t_num_tids of the aitem, we reallocate enough space in the iterator.
+	- ZSTidArrayItemDecode(item, &codewords, &slots, &slotwords)
+	- Decode all the codewords (simple8b_decode_words) and populate iterator
+	- Convert the delta tids to absolute tids after the simple8b decoding has finished by calling deltas_to_tids(firsttid, delta_tids, num_tids, tids).
+	- Expand the slotwords to actual slotnos for the iterator
+	- Copy the undoslots to the iterator.
+
+* zsbt_tid_item_create_for_range(tid, nelements, undo_ptr) - Create ZSTidArrayItem(s) to represent a range of continuous TIDs (deltas of 1) all having the same undo_ptr.
+	- Init slotno and num_slots for the undo stuff
+	- While nelements have not been catered to:
+		- Encode the items into codewords, one codeword at a time. Calls a variant of simple8b_encode to do an encoding of deltas 0, 1, 1, .., 1 (but has the same interface.)
+		- Create a new ZSTidArrayItem and fill in it's struct members such as number of tids, firsttid etc.
+		- Fill in undo slots and slotwords for the new item.
+		- Update firsttid = firsttid + total_encoded. (since TIDs are all consecutive)
+		- Append to a result containing the ZSTidArrayItem(s)
+	- Return result.
+
+* zsbt_tid_item_add_tids(item, firsttid, nelements, undo_ptr, item_modified) - Add a range of continuous TIDs to an existing ZSTidArrayItem (may have to overflow and create a new ZSTidArrayItem). Return a list of the resultant ZSTidArrayItem(s)
+	- If item is null call zsbt_tid_item_create_for_range(..) to return new item(s).
+	- TODO: We don't try to add items to the last codeword
+	- If there is not enough space to add a new codeword to item (exceeded ZSBT_MAX_ITEM_CODEWORDS), we call zsbt_tid_item_create_for_range() to return new item(s).
+	- Determine UNDO slot details.....
+	- Create as many codewords that fits/needed with simple8b_encode_consecutive similar to whats inside zsbt_tid_item_create_for_range().
+	- If there is not enough space to add a new codeword to item, we call zsbt_tid_item_create_for_range() to return new item(s).
+	- Fill in 'newitem' to represent the modified passed in item. Copy over existing codewords to the newitem, followed by the new ones. Copy over the UNDO slots followed by a new slot if any. Copy over slotwords and then add to the last partial slotword.
+	- If there are elements remaining, we call zsbt_tid_item_create_for_range with the range starting at newitem->t_endtid and append it to our result list of items containing newitem.
+	- Return result list of items.
+
+* zsbt_tid_item_change_undoptr - TODO
+
+* zsbt_tid_remove(rel, tids) - Remove tids from the tid tree for rel. This is used during a vacuum.
+	- There is an assumption that the tids to be removed are in ascending order of tid.
+	- Iterate over tids to be removed using 'nexttid':
+		-- Find leaf page containing nexttid by zsbt_descend()
+		-- Loop over items (itemids eventually cast to ZSTidArrayItem)
+			--- Advance the iterator of the set of tids to be removed such that the next tid to be removed is at least greater than the current item's firsttid.
+			--- If nexttid is within item->t_endtid, call zsbt_tid_item_remove_tids(item, nexttid, tids, ..) to remove 'tids' from the current item and append the resulting item into 'newitems'.
+			--- Else, append the current unmodified item into newitems.
+		-- Advance the iterator of the set of tids to be removed until nexttid is beyond the current leaf page's hikey. (TODO: Maybe we could have passed the iterator to the zsbt_tid_item_remove_tids in order to avoid having to do this step?)
+		-- Increase the number of pins on the current leaf's buffer.
+		-- If there were newitems as a result of this iteration, call zsbt_tid_recompress_replace(rel, buf, newitems, NULL)
+
+
+* zsbt_tid_item_remove_tids(item, nexttid, remove_tids, recent_oldest_undo) - Remove a number of TIDs from an item for vacuum designated by remove_tids.
+	- Decode all the codewords by calling simple8b_decode_words.
+	- Decode all the slotwords.
+	- Iterate over all tids in the item:
+		-- Advance nexttid to TODO: Incomplete
+
+* zsbt_tid_multi_insert(rel, ntuples, xid, cid, spec_token, undo) - Populates tids for the new tuples.
+	- Find the right most leaf page as the site for the insert of number of tids = ntuples (using offset=maxoff).
+	- Add the tids to the last item in the right most leaf page by calling zsbt_tid_item_add_tids(lastitem, lasttid_in_page, ntuples, ..), which will return a list of new item(s) (if there is an overflow there will be more than one item) as 'newitems'.
+	- If the last item was modified, we call zsbt_tid_replace_item(rel, buf, targetoff=maxoff, newitems..)
+	- Else, we call zsbt_tid_add_items(rel, buf, newitems, ..) to add the multiple items.
+	- Return the start tid of the multi-insert just performed.
+
+* zsbt_tid_add_items(rel, buf, newitems, ..) - The items are appended to the end of the page.
+	- If the newitems can fit into buf:
+		-- Loop through the newitems and call PageAddItem starting at off = maxoff + 1.
+		-- Mark buf as dirty.
+		-- Unlock buf.
+	-- Else:
+		-- Add all existing page items to a list: 'items'.
+		-- Add the new items to the end of the list.
+		-- Increment ref count on the buffer.
+		-- Call zsbt_tid_recompress_replace(rel, buf, items, ..) to rewrite the entire leaf page with 'items'. Calling this routine may involve page splits. Everything will be taken care of by the routine.
+
+* zsbt_tid_replace_item(rel, buf, targetoff, newitems, undo_op)
+	- Locate olditem at targetoff
+	- Calculate space required to replace olditem with newitems.
+	- If there is enough space in buf:
+		-- 
+	- Else:
+		-- We create items, a list with the newitems inserted.
+		-- We call zsbt_tid_recompress_replace(rel, buf, items, undo_op)
+
+
+* zsbt_tid_recompress_context{currpage, stack_head, stack_tail, num_pages, free_space_per_page, hikey}
+
+* zsbt_tid_recompress_replace(rel, oldbuf, items, undo_op) - Rewrite a TID tree leaf page with new items.
+	- Assumption items fit within the lokey and hikey of oldbuf?
+	- If there are any uncompressed items in the list, we try to compress them.
+	- If the items can no longer fit on the page or page(s), we will have to keep splitting it.
+	- On entry, oldbuf must be pinned and exclusive locked (TODO: caller zsbt_tid_remove..where does it guarantee that the buffer is exclusive locked?). On exit, only the lock is released.
+	- Pick a split for the items by calling zsbt_tid_recompress_picksplit(recompress_cxt, items).
+	- Based on the split chosen, call zsbt_tid_recompress_newpage(cxt, oldbuf's lokey, flag designating ZSBT_ROOT if oldbuf was root). Note that the cxt doesn't have a currpage and has an empty stack. The cxt's hikey is oldbuf's hikey.
+	- For each item: we call zsbt_tid_recompress_add_to_page(cxt, item)
+	- At this point, we have a list of pages (in the stack with the leftmost leaf at head) to replace oldbuf as private in-memory copies. We can now allocate buffers for them and write them out. We can reuse oldbuf for the left most new leaf and we allocate new buffers for the rest of the leaves. For each extra leaf blk_l apart from the leftmost, we create downlinks of the form: (prev_leaf_hikey, blk_l)
+	- Now we have to insert the downlinks created above. (i.e. If there is more than one stack entry, there would certainly be at least one downlink) 
+		-- If oldbuf represented a root at the start, then we have the scenario where we have to replace the singleton root with >1 leaves. This calls for a new root for the tree. So we call zsbt_newroot(rel, .., leaf_level + 1, downlinks) and append the resulting stack entry to the stack.
+		-- Else, simply call zsbt_insert_downlinks(rel, .., oldbuf's lokey, oldbuf, leaf_level + 1, downlinks) and append the result to the stack.
+	- Call zs_apply_split_changes(rel, cxt's stack head, ..)
+
+
+
+* zsbt_tid_recompress_picksplit(recompress_cxt, items) - Compute (ONLY) how much space the items will take and compute how many pages will be required. Also decide how to distribute the free space left over among the pages involved (aim for 50-50 split for non-rightmost pages and 90-10 split for the rightmost page).
+	- Compute total space needed for all the items. Loop over all the items passed in and add the size of the item struct along with the t_size (size of the item's payload).
+	- Choose the split as described above and store the decision in recompress_cxt's 'num_pages' and 'free_space_per_page'.
+
+* zsbt_tid_recompress_newpage(recompress_cxt, nexttid, flags)
+	- If the cxt has a currpage, this is considered a "previous" page. We set the hikey of that page to be equal to nexttid.
+	- Allocate a new page.
+	- Create a stack entry for the new page.
+	- Push the entry on to the stack. (TODO: Maybe write push/pop routines for the stack?)
+	- Set the currpage to point to the newly created page.
+	- Fill in the opaque section of the new page. Set lokey to nexttid and the hikey to be equal to cxt's hikey (TODO: This is UGLY). Set zs_flags to flags passed in.
+
+* zsbt_tid_recompress_add_to_page(recompress_cxt, item)
+	- If there is not enough space to add the item to the cxt's currpage, call zsbt_tid_recompress_newpage(cxt, item's firsttid, 0).
+	- PageAddItem(cxt->currpage, item, ..)
+
+
+zedstore_simple8b.c
+-----------------------------------
+
+* simple8b_encode(ints, num_ints, num_encoded) - Encode as many ints as possible (reported via num_encoded) into a single codeword and return the codeword.
+
+zedstore_attpage.c
+-----------------------------------
+
+* Routines for handling attribute leaf pages.
+
+* zsbt_attr_add(rel, attno, attstream_buffer) - Add the new items contained in the attstream_buffer to the page (involves a flush). In a single invocation, it will add as much data as possible to a single page after compression. This means it might need to be repeatedly invoked with the same attstream_buffer to ensure all the data in the buffer ends up on disk.
+	- Find the target page by calling zsbt_descend with attstream_buffer's firsttid.
+	- Retrieve the lower and upper streams (ZSAttStream) from the target page.
+	- If the lower stream is empty
+		-- If the page has enough space to accommodate the data in the attstream_buffer:
+			--- If the attstream_buffer's lasttid does NOT fit into the page (check if the lasttid is lesser than the page's hikey), we chop the attstream_buffer at splittid = page's hikey - 1.
+			--- We construct a temporary ZSAttStream header with the attstream_buffer (which may have been modified to be the left buffer as a result of a split) and fill in the new size, pd_lower and lasttid. Then we overwrite the original lower attstream header with the new one.
+			--- We copy over the attstream_buffer's data (cursor..len) into the page.
+			--- Mark buffer as dirty and WAL log the "attstream_change".
+			--- If we did do a split, we overwrite the attstream_buffer completely with the right_buffer we constructed during the split. This has the effect of zsbt_attr_add being not quite done with the logical add. The caller would have to call zsbt_attr_add again.
+	- If the lower stream is not empty:
+		-- If the attstream_buffer's lasttid fits into the page (check if the lasttid is lesser than the page's hikey), try to append the attstream buffer in place to the lower stream. If the append is successful:
+			--- Mark buffer as dirty and WAL log the "attstream_change"
+			--- Update the pd_lower (TODO: Shouldn't we do this inside append_attstream_inplace?).
+	- >>>>>>>>>>TODO: Flesh out this conditional...possibly refactor it!! If the original page contains an upper stream and it is almost full (~ 2.5% of free space), don't recompress the original page with the new data. Instead, create a new page and then "re"pack it with the new data (the new data would live compressed in the new page)
+	-- Else, we can rewrite the existing data on the page with as much of the new data as it fits.
+			---  If both upper and lower streams exist on the page:
+				---- We first merge the attstream_buffer into the lower stream
+				---- Then we merge the upper and lower streams together and reflect that in the passed in attstream_buffer.
+				---- Then we repack the resultant page with the merged attstreams.
+		
+
+* Repacking: A repacking operation involves:
+	1. zsbt_attr_repack_init() - Obtain a copy of the page that needs to be repacked.
+	2. zsbt_attr_pack_attstream() - Compress and write as much data as possible into the copy of the old page.
+	3. zsbt_attr_repack_newpage() - Create a new page to compress and write any left over data from step 2.
+	4. zsbt_attr_repack_writeback_pages() - Finish repacking operation and finally perform on-disk changes.
+
+	- zsbt_attr_repack_context {currpage, head_stack, tail_stack, attno, hikey, nextblkno}
+		-- The tail of the stack is the top of the stack. The head is the bottom.
+
+	- zsbt_attr_repack_init(repack_cxt, attno, origbuf, append) [TODO]
+		-- Allocate a new page
+		-- Populate the new page. If append is true, memcpy the entirety of the origpage(from origbuf) into the new page. Otherwise call PageInit.
+		-- Set the context's currpage to the new page and put the new page on the split stack.
+
+	- zsbt_attr_pack_attstream(att, attstream_buffer, page) - Compress and write as much of attstream_buffer into the supplied page as we can, overwriting the existing upper stream if necessary. This leaves the attstream_buffer with the chunks that could not be fit into the page.
+		-- TODO: should the destination compressbuf be of size = BLCKSZ?
+		-- Compress the data in attstream_buffer into compressbuf.
+		-- Determine "complete_chunks_len", the total size of all of the full chunks that were compressed and lasttid of the compressed result. If all the bytes weren't compressed, then we would have to call find_attstream_chop_pos(), whose return value would be the end of the last full chunk that was compressed.
+		-- Overwrite the upperstream's header to update it to reflect the compressed results.
+		-- Overwrite the upperstream's payload with the compressed data.
+		-- Update pd_upper.
+
+	- zsbt_attr_repack_newpage(repack_cxt, nexttid) -
+		-- Allocate and init a new page.
+		-- Put the new page on the stack.
+
+	- zsbt_attr_repack_writeback_pages(cxt, rel, attno, oldbuf) -
+		-- At this point we have page(s) to replace the original page being repacked as private in-memory copies on the stack. Having multiple pages on the stack indicate that we needed to split the original page.
+		-- Traverse the stack of pages in cxt [BOS, TOS):
+			--- With the page at BOS as the exception, pages on the stack have not had their buffers assigned yet. So we create and assign them (update their zs_next to the block nos of the buffers created). 
+			--- Create downlinks for all of the pages and store them in downlinks
+		-- For the page at TOS, we assign zs_next to point to cxt's nextblkno.
+		-- If we have multiple pages on the stack (i.e. a split was necessary)
+			--- Check if the bottom of stack represents the root of the attribute tree. If it does:
+				---- Create an extra downlink that we prepend to downlinks.
+				---- We call zsbt_newroot to create a new root.
+				---- Clear the root-ness of the old root.
+			--- Else:
+				---- Call zsbt_insert_downlinks(rel, attno, z)
+		-- Overwrite all pages that we have had to modify by calling zs_apply_split_changes
+
+
+
+
+
+zedstore_freepagemap.c
+-------------------------------------------------------------------
+
+* Keeps track of unused pages in the relation.
+
+* LL of pages.
+
+* A block stored maybe unusable, so we need to conduct a sanity check to ensure that the page is usable.
+
+* ZSFreePageOpaque{next block (zs_next), padding, ZS_FREE_PAGE_ID(zs_page_id)}
+
+* zspage_is_unused(buf) - TODO: update comment. Check if the page is unused
+
+* zspage_getnewbuf(rel) - Returns a "new" page from the free space map. Does not initialize it. Returns it exclusive-locked.
+	- Grab the metapage in order to grab the freepage map LL head
+	- If there is such a free page:
+		-- Lock the page
+		-- Ensure that the page is really unused. (zspage_is_unused())
+		-- Detach the page from the LL and update the head of the LL to be the current page's next.
+		-- WAL log : WAL_ZEDSTORE_FPM_REUSE_PAGE
+		-- Unlock meta-page
+	- Else:
+		-- Unlock meta-page
+		-- There are no free pages left in the relation, so we need to extend the relation beyond the one relfile. We call zspage_extendrel_newbuf(rel)
+
+* zspage_extendrel_newbuf(rel) - Returns a new page exclusive locked where the new page does not come from the freespace map.
+	- Extend the relation: May lead indirectly to a smgr_extend() call with blocknum = smgr_nblocks() [Note: block nums start w/ 0] by calling ReadBuffer(rel, P_NEW)
+	- Exclusive locks the page
+	- If the relation was "local" (only visible to the current backend) before it was extended, then we can unlock the extension lock on the relation.
+
+* zspage_delete_page(rel, buf, metabuf) - Mark a page as deleted and recyclable and add it to the FPM.
+	- The caller must have an exclusive lock on the page.
+	- Fetch meta page if not passed in and exclusive lock it.
+	- zspage_mark_page_deleted(page, next_free_blk)
+	- Make the page head of the FPM.
+	- WAL log the operation.
+
+* zspage_mark_page_deleted(page, next_free_blk) - Mark zs_page_id as free and set zs_next to next_free_blk.
+
+
+zedstore_inspect.c
+--------------------------------------------------------
+
+* pg_zs_dump_attstreams(reloid, blkno) - dumps:
+	- attno int4
+	- chunkno int4
+	- upperstream boo
+	- compressed bool
+	- attbyval bool
+	- attlen int4
+	- chunk_cursor in
+	- chunk_len int4
+	- num_elems int4
+	- firsttid zstid
+	- lasttid zstid
+	- tids[] zstid
+	- datums[] bytea
+	- isnulls[] bool
+
+
+Questions:
+
+1. In uncompressed form, an attribute stream on a page can be arbitrarily
+large, but after compression, it must fit into a physical 8k block. If
+on insert or update of a tuple, the page cannot be compressed below 8k
+anymore, the page is split.
+
+ZSAttStream: It is used to pass data around in memory, in which case it can be arbitrarily long?
+
+How can it be arbitrarily large?
+
+2. The buffer cache caches compressed blocks? Likewise, WAL-logging,
+full-page images etc. work on compressed blocks? How? Are we saying that we only store the compressed stream in the buffer cache?
+
+3. There is enough concurrency control info in any given B-tree page to detect if any other backend is stepping on the page (like splitting it or deleting it). For example, if a
+  B-tree page is split just when you are about to step on it, you
+  can detect that by looking at the lo/hi key. How? 
+If a page is deleted,
+  that can be detected too, because the attribute number or lo/hikey
+  are not what you expected. In that case, start the scan from the
+  root.
+
+4. Insert: Row -> Datums -> decides block for TID tree (leaf page? of tid tree) to insert -> then decides the exact TID? -> writes UNDO record -> inserts into the attribute trees as necessary.
+
+5. Was the new table AM API addition committed upstream?
+
+6. META Page:
+Block 0 is always a metapage. It contains the block numbers of the
+other data structures stored within the file, like the per-attribute
+B-trees, and the UNDO log. What are these block numbers? What do they look like? Are they the same as page Ids? Are block numbers actually page numbers? Seems to be..evidence: Free Pages Map.
+
+7. What is a compressed page vs an uncompressed page? I thought we had compressed/uncompressed pages within a page as opposed to the compression of the whole page itself.
+
+8. Space wastage? attlen and attbyval in attstream_buffer and attstream_decoder? Maybe these are not stored on disk so thats okay.
+
+9. What is the "BlockNumber next" in the ZSBtreePageOpaque for?
+
+10. How are the ZSBtreeInternalPageItem->tid and childblk used?
+
+11. Are TIDs reused? The section on vacuum seems to suggest that?
+
+12. There could be different strategies of course with respect to when we compress. Maybe it should be done in the background?
+
+13. Do we compress TID tree leaf ZSTidArrayItems? There is mention of "packing" them tightly. They can be packed since they are usually in ascending order, gap between two TIDs in a sequence is usually small, nearby TIDs are probably going to have the same UNDO pointer.
+
+14. UNDO pointers vs UNDO slots? 0-2 UNDO pointers? 4 slots?
+
+15. get_tuplebuffer: Probably a get or create?
+
+
+Upstream discussion:
+
+1. tids are logical to help move them around in B-tree nodes.
+2. tuple's tid never changes.
+3. Variable size blocks pose need for increased logical to physical mapping maintenance, plus
+  restrictions on concurrency of writes and reads to files.
+4. When adding column, just need to create new Btree for newly added column and linked to meta-page. No existing content needs to be rewritten.
