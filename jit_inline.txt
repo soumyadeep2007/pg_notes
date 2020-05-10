@@ -1,4 +1,4 @@
-* SimpleInliner is the pass used
+* SimpleInliner is the pass used.
 
 * inlinehint is the option that "inline" keyword translates to. Its threshold default is higher than the default.
 
@@ -33,3 +33,6 @@
 
 		-- If any non-inlineable trait (or if inlining is discouraged. eg. if caller is a recursive function, we dont want to inline as stack usage my spike..look if the allocatedSize is high enough to determine the very same) was detected on the visit.
 
+* It seems that there is no good way to inline functions across modules w/o having to write your own version of SimpleInliner.
+	Inlining functions across modules thread:
+	http://lists.llvm.org/pipermail/llvm-dev/2014-April/071972.html

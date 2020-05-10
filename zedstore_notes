@@ -49,9 +49,13 @@ sequential scan walks all the B-trees in lockstep.
   on each leaf page to easily re-build the internal pages from
   scratch, in case of corruption, for example.
 
-* zedstore has undo pointer with each item directly (in the TID leaf page). In case
-of bulk load the undo record pointer is maintained for array of items
-and not per item.
+* For each tuple, we logically store an undo pointer associated with the tuple's tid in the tid item (the actual visibility information is stored in the UNDO log separately).
+
+	- Dead tuples have a DeadUndoPtr value.
+
+	- Vacuum is much faster in Zedstore as it only has to scan the tid tree in it's quest to find dead tuples. But runtimes show otherwise? (storageperf..possible that there is not enough data)
+
+* In case of bulk load the undo record pointer is maintained for array of items and not per item.
 
 * TOAST: For an oversized datum -> it is broken into chunks and these chunks are stored on a dedicated toast page (toast pages are maintained as a doubly linked list) WITHIN the same physical file.
 
@@ -104,7 +108,28 @@ zedstore_internal.h
 
 * ZSTidArrayItem: Leaf item of TID tree. Has tids in : [t_firsttid, t_endtid - 1]
 Structure of an item: Header  |  1-16 TID codewords (Simple 8-b) | 0-2 UNDO pointers | UNDO "slotwords"
-TODO: fill this with info on UNDO slots....
+
+	- Tids and undo pointers are stored encoded in a format which takes advantage of the common case where the gaps b/w tids are small and most tuples are visible.
+
+	- It is common for the UNDO ptr to be old so that the tuple is visible to everyone. In that case, we can do with an inexact value.
+
+	- Nearby TIDs are likely to have only a few distinct UNDO ptrs.
+
+	- UNDO slots represent the set of distinct UNDO ptrs for the tids in the item.
+
+		-- There are 4 logical slots.
+
+		-- Slots 0,1 -> special: all-visible old tids and dead tids respectively
+
+			--- They are not stored in the item itself but can be thought to be part of every item. So the number of slots physically stored in the item is t_num_undo_slots - 2.
+
+			--- With the 4 UNDO slots, we can represent an UNDO pointer using a 2-bit slot #.
+
+			--- If a tuple is updated, and if the corresponding ZSTidArrayItem has all of its 4 slots filled, we would need to split the ZSTidArrayItem. This shouldn't happen very often.
+
+			--- After the UNDO slots, we have UNDO slotwords, which contain the slot # for every tuple in the item (they are packed n 64 bit ints with 2 bits per tuple)
+
+			--- The advantage of this summarized information (the UNDO slots) comes from the fact that during a visibility check, it suffices to check just the slots against the snapshot, instead of having to incur a per-tuple check cost.
 
 * ZSToastPageOpaque and varatt_zs_toastptr
 
@@ -140,6 +165,10 @@ of all the modified pages. The page split (or merge) routines don't modify pages
 * ZedstoreTupleTableSlot - "materialized" data (an opaque byte array) with ZSUndoSlotVisibility info.
 
 * ZSTidArrayItemDecode(item, codewords, slots, slotwords) - Decodes passed in ZSTidArrayItem into passed in space for codewords, slots and slotwords.
+
+* zsbt_attr_fetch(scan, datum, isnull, zstid) - Returns true if a matching item is found.
+	- Lookup tid in scan->decoder->tids. If present, we can return the datum at the same index in scan->decoder->datums.
+	- Use zsbt_attr_scan_fetch_array() otherwise to decode more elements such that we cover the zstid passed in and then return the corresponding datum.
 
 zedstore_tupslot.c
 --------------------------
@@ -220,6 +249,48 @@ zedstoream_handler.c
 
 * Table AM implementation for ZedStore
 
+* ZedStoreDescData - subclass of TableScanDescData
+	- Has projection info -> ZedStoreProjectData
+
+* ZedStoreProjectData
+	- project_columns // bitmap set, NULL => need all the columns
+	- proj_attrs // attnos including 0.
+	- ZSTidTreeScan tid_scan
+	- ZSAttrTreeScan *attr_scans
+	- cur_range_start
+	- cur_range_end
+	..
+
+* ZSTidTreeScan
+	- rel
+	- active
+	- lastbuf
+	- lastoff
+	- snap
+	- starttid
+	- endtid
+- currtid // tid returned by last scan
+	- recent_oldest_undo
+	- serializable
+	- acquire_predicate_tuple_locks
+
+	// The following fields are used when the scan is processing an array item.
+	- ZSTidItemIterator array_iter
+	- array_cur_idx
+
+* ZSAttrTreeScan
+	- rel
+	- attno
+	- attdesc // pg_attribute
+	- context
+	- active
+	- lastbuf
+	- lastoff
+
+	// Fields used when scan fetches an array tuple
+	- attstream_decoder
+	- decoder_last_idx
+
 * zedstoream_get_latest_tid(tablescan, tid)
 	- Convert tid (I/O param) into a zstid
 	- Flush tuple buffer for scan's rel.
@@ -239,6 +310,29 @@ zedstoream_handler.c
 	- zsbt_tuplebuffer_spool_slots(rel, tids, slots, ntuples)
 	- Populate the tableOid and zstid-converted-to-tid for all slots.
 	- Update stats to register an insert of n tuples.
+
+* zedstoream_beginscan_with_column_projection(rel, snap, nkeys, key, project_cols)
+	- Returns a ZedstoreScanDesc a sub-class of TableScanDesc.
+	- AM API method added by us
+
+* zedstoream_getnextslot(scan, direction, slot)
+	- Called once per invocation of ExecScanFetch
+	- If we are not in the middle of a scan yet:
+		-- zs_initialize_proj_attributes(slot->tts_tupleDescriptor, scan_proj) to transform the bitmapset of columns into attnums. This also adds the attnum = 0.
+		-- parallel scan specific setup
+		-- cur_range_start = MinZSTid, cur_range_end = MaxZSTid + 1
+	- Init the tid scan and the attr scans.
+	- Clear the slot and init to all nulls
+	- Fetch the next visible tid: zsbt_tid_scan_next(scan->scan_proj->tid_scan, direction)
+	- Fetch the datums of each attribute for the fetched tid in a loop over all attributes.
+		- Use zsbt_attr_fetch(attrscan, datum, isnull, zstid) to fetch the datum. If the result of the call is false, then we know the attr value is missing and then we call zsbt_fill_missing_attribute_value().
+		- TOAST specific stuff
+		- UNDO specific stuff
+
+* zsbt_tid_begin_scan(rel, starttid, endtid, snap, tidtreescan) - Sets up tidtreescan with the passed in info.
+
+* zsbt_attr_begin_scan(rel, tupdesc, attno, attrscan) - Sets up attrscan with the passed in info.
+
 
 zedstore_tuplebuffer.c
 --------------------------------------
