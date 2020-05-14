@@ -1,0 +1,26 @@
+relscan.h
+--------------------------------------
+
+* TableScandescData - generic desc for table scans. Base-struct for table scans (sub-structure pattern)
+	- Relation rs_rd // relation descriptor
+	- SnapshotData
+	- rs_nkeys // #scan keys
+	- ScanKeyData *rs_key // scan key descs []
+	- rs_flags
+	- rs_parallel // parallel scan desc
+
+
+skey.h
+--------------------------------------
+
+* A ScanKey represents a comparison b/w a table/index col and a constant.
+
+* If there is an array of scan keys, the comparison conditions are ANDed.
+
+
+tableam.h
+--------------------------------------
+
+* table_scan_getnextslot(tablescandesc, direction, slot) - Return next tuple from scan represented by tablescandesc and store value in slot.
+
+* 

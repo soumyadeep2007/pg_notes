@@ -1,0 +1,210 @@
+HA, load balancing and replication, backup and restore:
+
+* Backup strategies: - SQL dump and restore
+
+	- File system level backup
+
+	- Continuous archiving
+
+* File system level backup
+	- tar up the data dir?
+		-- worse than SQL dump. why?
+			server needs to be brought down (buffering in the server and also the server
+			needs to be shut down if we want to restore)
+
+		-- lose capability of doing more granular backup/restore..pg_wal has no
+		-- filtering capacity. So this method will only work for a full backup.
+
+	- Consistent snapshot of the data dir. 0. (Optional) CHECKPOINT;
+
+		1. Use file-system feature to make "frozen snapshot" of the volume
+		containing the database.
+
+		2. Then copy over the datadir from that snapshot to a backup device.
+
+		3. Release the frozen snapshot.
+
+		-- No server downtime is required.
+
+		-- Caveats: the datadir state captured like this will point to a state where
+			the server was still up. If we try to bring the server back up in this
+			situation, the server will think that it had crashed before and will go
+			into recovery and try to replay WAL. If we did step 0, then recovery time
+			will be lesser.
+
+		-- If the setup has tablespaces, which are on different file systems, taking
+			1. is difficult as simultaneous snapshot may be very difficult. In this case,
+			this strategy IS NOT GOOD!!
+			--- There is a workaround: shutdown the server and
+			after a significant time period, take all of the frozen snapshots.
+			OR 
+			--- Enable continuous archiving only for the duration of 1-4. and then restore
+			using continuous archive recovery.
+
+	- Use rsync
+		1. rsync while live
+
+		2. Shutdown server
+
+		3. rsync --checksum
+
+* Continuous archiving and PITR:
+
+	- Third strategy for backups: File-system
+	level backup (base backup) + continuous backup of WAL files
+
+	- Advantages: 
+		-- We can start with a inconsistent file system as the starting
+			point. We can just do with a tar, we don't need a consistent snapshot.
+			--- Inconsistencies can be resolved after WAL replay.
+
+		-- For large databases, where taking full backups is expensive, "continuous
+			backup" can be achieved by continuously archiving the WAL files.
+
+		-- It is not necessary to replay the WAL all the way, we could stop at any
+			point and we will have a consistent snapshot of the database. It is
+			possible to PITR to any point since the last base backup (since we have
+			all the WAL since the last base backup).
+
+			Instead of continuously archiving the WAL files, we could stream the WAL
+			files over to another server that borne out of the same base backup. The
+			result is a warm standby.
+
+	- WAL archiving setup: -- WAL records are grouped into segment files (of
+			16MB, but can be configured).
+
+		-- Segment names are numerical and are recycled (only if we are not using
+			WAL archiving).
+
+		-- postgresql.conf 
+
+			--- wal_level >= replica
+
+			--- archive_mode = on
+
+			--- archive_command = <shell command to copy over the WAL segments
+				wherever> 
+				> e.g. archive_command = 'test ! -f /mnt/server/archivedir/%f && cp
+					%p /mnt/server/archivedir/%f' 
+					(%p= <path_to_file>, %f = <file_name>).
+
+				> e.g. substitution: 
+				test ! -f /mnt/server/archivedir/00000001000000A900000065 
+				&& cp pg_wal/00000001000000A900000065 /mnt/server/archivedir/00000001000000A900000065
+
+		-- Setup has to be calibrated well enough to ensure the failure case for WAL
+			archiving is handled well (what if archive command fails because of the
+			destination? -> pg_wal will continue to build until the disk is full, in
+			which case Postgres will perform a PANIC shutdown).
+
+		-- It is important to have the right security for the WAL archive.
+
+		-- One MUST keep in mind that restoring from a WAL archive will apply all
+			possible changes EXCEPT CHANGES TO conf files such postgresql.conf!!!
+			These changes ARE NOT WALed.
+
+		-- The archive_command is invoked only when a WAL segment becomes full!
+			That means that there can be a a long delay between the completion
+			of a transaction and it's safe recording in archive storage.
+
+			But wait..what if the server does not generate 16MB of WAL?? ->
+			What we have to do then is configure archive_timeout to perform a
+			"segment file switch" to a new file, making the old file a candidate
+			for archiving.
+			Now, the old file will still be sized at 16MB!!!!!! (this means that
+			setting a small archive_timeout will lead to WAL bloat!!!!)
+
+			Note: a WAL file switch can also be perfomed by explicitly calling
+			pg_switch_wal().
+
+		-- One can pause archival temporarily by overriding archive_command to ''.
+			This will cause backup of wal files in pg_wal of course.
+
+
+	- Taking a base backup
+		-- Use tar mode or non-tar mode (tar -> extract to dir)
+
+		-- Use binary or sql function
+
+		-- To make use of a base backup, one needs access to the WAL segments
+			generated during and after the pg_basebackup invocation. To help us
+			out, pg_basebackup generates a backup_history file that is named as
+			follows: If the starting WAL file is 0000000100001234000055CD,
+			history file name: 0000000100001234000055CD.007C9330.backup
+
+			After we make copies of these, all WAL segments < than the name of
+			the backup file can be deleted.
+
+		-- 
+
+
+
+* Primary/master - server having r/w capabilities
+
+* Secondary/standby - server having only r capability - warm standby: server
+can't answer queries until it is promoted - hot standby: server can answer r/o
+queries
+
+* Sync solution: Tx is not considered committed and changes not reflected on
+* any server, untill all of the servers have applied the changes. No stanby
+* can fall behind.
+
+* Solution can not only be deployment level but also database level or even,
+* table level.
+
+* Log shipping standbys setup:
+
+	- Primary operates in continuous archiving mode.
+
+	- Replica operates in continuous recovery mode.
+
+	- File based log shipping:
+		-- MTU: 1 log segment (1 log file) ~ 16MB
+
+	- Record based log shipping:
+		-- MTU: 
+
+	- Log shipping is async..there exists a window for loss, i.e. primary goes
+		down and the unshipped WAL is lost. 
+		-- Size of data loss window regulated by
+			archive_timeout GUC.
+
+		-- Streaming replication is a technique to lower the window considerably.
+
+	- Constraint: All servers should be running the same version of Postgres.
+
+
+	- Standby server operation: 
+		-- archive-based replication: can read wal directly from a WAL archive
+			(GUC: restore_command) 
+			--- restore command: shell command with special syntax to retrieve an
+				archived wal segment. e.g. 'cp /mnt/server/archivedir/%f "%p"'
+				// %p->dest dir, %f->file from archive
+
+		-- or can read wal directly from the master over a TCP connection. //streaming replication
+
+		-- standby will also play anything in its own pg_wal directory.
+			There can be stuff in that directory, especially if the standby went down while there was
+			stuff shipped from the master but not replayed yet.
+
+		-- Standby order of ops:
+			1. Restore all WAL available in archive location
+				using "restore_command".
+
+			2. Once 1. is done (restore_command will fail if there are no files left),
+				restore any files from its pg_wal dir.
+
+			3. Once 2. is done, and streaming replication is set up, standby will
+				connect to the primary and start streaming WAL from the last valid record
+				it found in step 1. or step 2.
+
+			4. If step 3. fails, go back to step 1.
+
+			This loop can be broken if:
+			i) Server stops.
+
+			ii) Failover triggered by a trigger file or by "pg_ctl promote".
+
+	- Master server prep:
+
+

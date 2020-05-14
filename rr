@@ -1,0 +1,40 @@
+GDB notes:
+
+* x/4096xb <pointer> -> will print 4096 bytes in hex format starting from pointer.
+
+Example:
+
+...
+0x7ff21bdd9650: 0x0d    0xff    0xff    0xf4    0x0f    0x5c    0x91    0xff
+0x7ff21bdd9658: 0xff    0xff    0x6d    0x40    0x08    0x10    0x22    0x6a
+...
+
+* Dump memory:
+dump memory <to_file_name> start_pointer end_pointer
+
+* Restore:
+
+
+RR notes:
+
+* rr record
+
+* rr replay -f <pid>
+
+* rr replay -M ... puts in helpful pid information with each stdout line.
+
+* TMP_DIR env variable to specify a tmp dir for RR to make temp files.
+	rr does a lot of copies, we observed this when we were replaying two concurrent COPY sessions.
+
+* checkpoint # creates a checkpoint
+
+* restart <checkpoint#> -> will go upto checkpoint
+	-- Jumping b/w checkpoints is pretty fast as compared to replay
+
+* rr has event numbers corresponding to where we are in the recording.
+	-- "when" will give you the event#.
+	-- an event # is generated for things like syscalls, signals etc.
+	-- It is possible to replay upto a specific event #
+		rr replay .. -g <event#>
+		This will replay upto the event# and then attach the debugger.
+	-- It may be worthwhile trying to replay 
