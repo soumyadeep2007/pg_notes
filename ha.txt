@@ -15,7 +15,8 @@ HA, load balancing and replication, backup and restore:
 		-- lose capability of doing more granular backup/restore..pg_wal has no
 		-- filtering capacity. So this method will only work for a full backup.
 
-	- Consistent snapshot of the data dir. 0. (Optional) CHECKPOINT;
+	- Consistent snapshot of the data dir.
+		0. (Optional) CHECKPOINT;
 
 		1. Use file-system feature to make "frozen snapshot" of the volume
 		containing the database.
@@ -117,14 +118,22 @@ HA, load balancing and replication, backup and restore:
 			Note: a WAL file switch can also be perfomed by explicitly calling
 			pg_switch_wal().
 
+			Also one may provide a script for the archive_command. For eg, one
+			may want to batch WAL files together before sending them over.
+
 		-- One can pause archival temporarily by overriding archive_command to ''.
 			This will cause backup of wal files in pg_wal of course.
+
+		-- archive_cleanup_command can be specified to periodically clean up WAL
+			segments that may have aged. It can be anything. For a single standby
+			mode, we can make do with pg_archivecleanup.
 
 
 	- Taking a base backup
 		-- Use tar mode or non-tar mode (tar -> extract to dir)
 
-		-- Use binary or sql function
+		-- Use binary or sql API + tar(needs lots of orchestration, but allows)
+			for a lot more fine grained control.
 
 		-- To make use of a base backup, one needs access to the WAL segments
 			generated during and after the pg_basebackup invocation. To help us
@@ -135,8 +144,51 @@ HA, load balancing and replication, backup and restore:
 			After we make copies of these, all WAL segments < than the name of
 			the backup file can be deleted.
 
-		-- 
+		-- Each backup has a label to uniquely identify it.
 
+	- Recovering using a continuous archive backup [can be used to perform
+		a targeted or continuous recovery (standby mode)]:
+		Steps for a targeted recovery:
+
+		1. Stop the server if its running
+
+		2. At least make a copy of the server's pg_wal dir. It may contain logs
+			that have not been archived since the server went down.
+
+		3. Clean datadir and under tablespace roots.
+
+		4. Restore the files from backup (make sure the files have the right permissions)
+			and make sure pg_tblspc contains the correct links.
+
+		5. Nuke the new pg_wal dir (as it represents old wal of the server taken
+			during the earlier base backup) and replace it with a new one with
+			the correct permissions.
+
+		6. Copy the files from step 2 to this new pg_wal dir.
+
+		7. Setup recovery settings (GUCs such as restore_command and recovery
+			target to indicate how to recover and how much to recover.. Typically,
+			the restore command is a cp command with a special format..described
+			below)
+			Also, create recovery.signal in datadir.
+
+		8. Prevent users from connecting to the database while the database is
+			recovering by temporarily updating pg_hba.conf
+
+		9. Start the server. The server will read through the archived WAL and
+			then the unarchived WAL from 6. Upon completion, the server itself
+			will remove recovery.conf and then normal database operation will
+			commence. If the recovery is halted at any time or there are any
+			crashes, the recovery process can simply be restarted (recovery
+			progress is tracked via updates made by the server to pg_control).
+
+		10. Sanity check contents of database. If check doesn't pass go to 1.
+
+	- Notion of timelines (to support arbitrary PITR)
+
+	- full_page_writes
+
+	- WAL archives are often compressed to save space
 
 
 * Primary/master - server having r/w capabilities
@@ -161,13 +213,14 @@ queries
 	- File based log shipping:
 		-- MTU: 1 log segment (1 log file) ~ 16MB
 
+	- Streaming replication:
+
 	- Record based log shipping:
 		-- MTU: 
 
 	- Log shipping is async..there exists a window for loss, i.e. primary goes
 		down and the unshipped WAL is lost. 
-		-- Size of data loss window regulated by
-			archive_timeout GUC.
+		-- Size of data loss window regulated by the archive_timeout GUC.
 
 		-- Streaming replication is a technique to lower the window considerably.
 
@@ -188,14 +241,14 @@ queries
 			stuff shipped from the master but not replayed yet.
 
 		-- Standby order of ops:
-			1. Restore all WAL available in archive location
-				using "restore_command".
+			1. Restore all WAL available in archive location using "restore_command".
 
 			2. Once 1. is done (restore_command will fail if there are no files left),
 				restore any files from its pg_wal dir.
 
 			3. Once 2. is done, and streaming replication is set up, standby will
-				connect to the primary and start streaming WAL from the last valid record
+				connect to the primary (using primary_conninfo) and will start
+				streaming WAL from the last valid record
 				it found in step 1. or step 2.
 
 			4. If step 3. fails, go back to step 1.
@@ -205,6 +258,96 @@ queries
 
 			ii) Failover triggered by a trigger file or by "pg_ctl promote".
 
-	- Master server prep:
+	- Master server prep: 
+		-- We need to setup the master for continuous archiving as
+			described before.
+
+		-- The archive location MUST be accessible from the primary!!! (optional
+			for a flavor of streaming replication)
+
+		-- For streaming replication, pg_hba.conf and roles need to be setup to
+			allow replication connections from the standby(s).
+
+		-- max_wal_senders need to be high enough to support multiple standbys
+
+	- Standby server prep:
+		-- Restore the base backup of the primary.
+
+		-- Create a standby.signal file in the standby's datadir
+
+		-- Specify a restore_command to fetch WAL from the WAL archive.
+
+		-- For multiple standbys, we have to set up the recovery_target_timeline.
+
+		-- To use streaming replication, we must specify primary_conninfo.
+
+		-- Set up continuous archiving as described above, for the rainy day when
+			the standby will be promoted.
+
+	- Streaming replication:
+		-- Standby stays more up-to-date than with log-shipping.
+
+		-- It is async by default!!! => lag b/w tx commit and changes on standby
+
+		-- If used w/o file-based continuous archiving, the server might recycle
+			old WAL segments before the standby gets a chance to receive them!
+			
+			There is the workaround by keeping "wal_keep_segments" high OR by
+			configuring a replication slot for the standby.
+			
+			If the WAL archive is indeed accessible from the standby, then we don't
+			need replication slots or the other workaround.
+
+		-- Start with a file-based log shipping standby server and if we add
+			the primary_conninfo GUC, and some auth stuff on the primary side, we
+			end up with a streaming replication setup!!
+
+		--  tcp_keepalives_idle, tcp_keepalives_interval and tcp_keepalives_count
+			help the primary promptly notice a broken connection.
+
+		-- Note: streaming replication will only start over the primary conn once
+			the standby has replayed all outstanding WAL in the archive.
+
+		-- Authentication setup....
+
+		-- Monitoring:
+			--- Replay lag and such can be calculated from pg_stat_replication.
+
+			--- pg_current_lsn, sent_lsn, write_lsn, flush_lsn, replay_lsn etc.
+
+	- Replication slots:
+		-- Automation to ensure master does NOT remove any WAL that hasn't been
+			sent to the standbys.
+
+		-- Alternatives to replication slots:
+			--- wal_keep_segments high enough.
+
+			--- Continuous archival of WAL.
+
+		-- Can lead to unbounded pg_wal sizes on the primary if replication slots
+			are used, as opposed to the alternatives above.
+
+		-- pg_replication_slots
+
+		-- Cascading replication: master -> standby (C) -> standby.
+
+			--- Minimzes connectivity to the master.
+
+	- Sync rep for streaming replication:
+		-- Allows for confirmation to a tx that all standbys have
+			written/flushed/applied all WAL associated with the tx.
+
+		-- synchronous_standby_names set and synchronous_commit = <write/apply...>
+			synchronous_commit can be as granular as we want.
+
+		-- May cause server shutdown to halt! (wal for an outstanding tx MUST be shipped)
+
+		-- Multi-standby setup..setup can be elastic as well.
+
+		-- Mode: streaming vs catchup
+			--- When the standby connects to the primary for the first time, it
+				will enter catchup mode and then it will transition over to
+				streaming when it is caught up.
+
 
 
