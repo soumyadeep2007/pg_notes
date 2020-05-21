@@ -1,0 +1,17 @@
+Install instructions for PG on FreeBSD 12.1-RELEASE-p5 GENERIC:
+
+sudo pkg install git
+
+Clone postgres
+
+pkg install bison
+
+# make won't work on FreeBSD for PG
+pkg install gmake
+
+# Provide the --with-includes and --with-libs to ensure readline can be located.
+./configure --enable-depend --enable-cassert --enable-debug CFLAGS='-O0 -fno-omit-frame-pointer' --with-libs=/usr/local/lib --with-includes=/usr/local/include --with-python --prefix=<> BISON=/usr/local/bin/bison
+
+gmake -j<> -s && gmake install -s
+
+
