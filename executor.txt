@@ -328,7 +328,7 @@
 
 		-- ExprState flags will contain EEO_FLAG_DIRECT_THREADED to indicate that this is a direct threaded dispatch.
 
-	- Complex or uncommon instructions are NOT implemented inline inside ExecInterpExpr(). They are implemented as heler functions.
+	- Complex or uncommon instructions are NOT implemented inline inside ExecInterpExpr(). They are implemented as helper functions.
 		- Why?
 			-- There won't be a noticeable performance gain.
 
