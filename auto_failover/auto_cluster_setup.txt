@@ -1,0 +1,106 @@
+## Straightforward cluster setup w/ trust based authentication
+
+# Cleanup
+rm -rf ~/failover/* ~/.local/share/pg_autoctl ~/.config/pg_autoctl /run/user/$(id -u $(whoami))/pg_autoctl
+
+# Create and run the monitor
+PG_AUTOCTL_DEBUG=1 pg_autoctl create monitor --pgport 7800 --auth trust --pgdata /home/pivotal/failover/monitor -v --no-ssl --hostname 127.0.0.1
+
+PG_AUTOCTL_DEBUG=1 pg_autoctl run --pgdata ~/failover/monitor/ -v
+
+# Create and run the primary
+PG_AUTOCTL_DEBUG=1 pg_autoctl create postgres --pgdata /home/pivotal/failover/primary --pgport=8800 --monitor postgres://autoctl_node@127.0.0.1:7800/pg_auto_failover?sslmode=prefer --auth trust --no-ssl --hostname 127.0.0.1
+
+PG_AUTOCTL_DEBUG=1 pg_autoctl run --pgdata ~/failover/primary --pgport 8800
+
+# Create and run the secondary
+PG_AUTOCTL_DEBUG=1 pg_autoctl create postgres --pgdata /home/pivotal/failover/secondary --pgport=9800 --monitor postgres://autoctl_node@127.0.0.1:7800/pg_auto_failover?sslmode=prefer --auth trust --no-ssl --hostname 127.0.0.1
+
+PG_AUTOCTL_DEBUG=1 pg_autoctl run --pgdata ~/failover/secondary --pgport 9800
+
+
+
+
+
+
+
+
+## Straightforward cluster setup w/ password based (md5) authentication
+
+# Cleanup
+rm -rf ~/failover/* ~/.local/share/pg_autoctl ~/.config/pg_autoctl /run/user/$(id -u $(whoami))/pg_autoctl
+
+# Create and run the monitor
+PG_AUTOCTL_DEBUG=1 pg_autoctl create monitor --pgport 7800 --auth md5 --pgdata /home/pivotal/failover/monitor --no-ssl --hostname 127.0.0.1
+
+# If we wanted to enforce password based auth between monitor and data nodes:
+# Edit pg_hba.conf for monitor to comment out the following line:
+# host    all             all             127.0.0.1/32            trust
+
+PG_AUTOCTL_DEBUG=1 pg_autoctl run --pgdata ~/failover/monitor/ -v
+
+# Setup the password to connect to the monitor. (for autoctl_node)
+psql -p 7800 -c "alter role autoctl_node password 'hackme';" postgres;
+
+# Create and run the primary
+
+PG_AUTOCTL_DEBUG=1 pg_autoctl create postgres --pgdata /home/pivotal/failover/primary --pgport=8800 --monitor postgres://autoctl_node:hackme@127.0.0.1:7800/pg_auto_failover?sslmode=prefer --auth md5 --no-ssl --hostname 127.0.0.1
+
+# Now change the hba.conf file
+
+PG_AUTOCTL_DEBUG=1 pg_autoctl run --pgdata ~/failover/primary --pgport 8800
+
+# Set the replication password
+# pg_autoctl config set replication.password 'rephack' --pgdata ~/failover/primary
+# psql -p 8800 -c "alter role pgautofailover_replicator password 'rephack';" postgres;
+
+# Create and run the secondary
+PG_AUTOCTL_DEBUG=1 PGPASSWORD=rephack pg_autoctl create postgres --pgdata /home/pivotal/failover/secondary --pgport=9800 --monitor postgres://autoctl_node:hackme@127.0.0.1:7800/pg_auto_failover?sslmode=prefer --auth md5 --no-ssl --hostname 127.0.0.1
+
+PG_AUTOCTL_DEBUG=1 PGPASSWORD=rephack pg_autoctl run --pgdata ~/failover/secondary --pgport 9800
+
+
+
+
+
+
+
+## Straightforward cluster setup w/ password based (scram-sha-256) authentication
+
+# Cleanup
+rm -rf ~/failover/* ~/.local/share/pg_autoctl ~/.config/pg_autoctl /run/user/$(id -u $(whoami))/pg_autoctl
+
+# Create and run the monitor
+PG_AUTOCTL_DEBUG=1 pg_autoctl create monitor --pgport 7800 --auth scram-sha-256 --pgdata /home/pivotal/failover/monitor --no-ssl --hostname 127.0.0.1
+
+echo "password_encryption = scram-sha-256" >> ~/failover/monitor/postgresql.conf
+
+# If we wanted to enforce password based auth between monitor and data nodes:
+# Edit pg_hba.conf for monitor to comment out the following line:
+# host    all             all             127.0.0.1/32            trust
+
+PG_AUTOCTL_DEBUG=1 pg_autoctl run --pgdata ~/failover/monitor/ -v
+
+# Setup the password to connect to the monitor. (for autoctl_node)
+psql -p 7800 -c "alter role autoctl_node password 'hackme';" postgres;
+
+# Create and run the primary
+
+PG_AUTOCTL_DEBUG=1 pg_autoctl create postgres --pgdata /home/pivotal/failover/primary --pgport=8800 --monitor postgres://autoctl_node:hackme@127.0.0.1:7800/pg_auto_failover?sslmode=prefer --auth scram-sha-256 --no-ssl --hostname 127.0.0.1
+
+echo "password_encryption = scram-sha-256" >> ~/failover/primary/postgresql.conf
+
+# Now change the hba.conf file to comment replication lines except pgautofailover_replicator
+
+PG_AUTOCTL_DEBUG=1 pg_autoctl run --pgdata ~/failover/primary --pgport 8800
+
+# Set the replication password
+# pg_autoctl config set replication.password 'rephack' --pgdata ~/failover/primary
+# psql -p 8800 -c "alter role pgautofailover_replicator password 'rephack';" postgres;
+
+echo "password_encryption = scram-sha-256" >> ~/failover/monitor/postgresql.conf
+
+# Create and run the secondary
+PG_AUTOCTL_DEBUG=1 PGPASSWORD=rephack pg_autoctl create postgres --pgdata /home/pivotal/failover/secondary --pgport=9800 --monitor postgres://autoctl_node:hackme@127.0.0.1:7800/pg_auto_failover?sslmode=prefer --auth scram-sha-256 --no-ssl --hostname 127.0.0.1
+
+PG_AUTOCTL_DEBUG=1 PGPASSWORD=rephack pg_autoctl run --pgdata ~/failover/secondary --pgport 9800

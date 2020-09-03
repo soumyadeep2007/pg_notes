@@ -1,0 +1,60 @@
+pg_auto_failover issues and feature request lists:
+
+* Feature: The ability to set a password for connecting to the monitor in the pg_autoctl create monitor command itself.
+	-> will remove the need to: "alter user autoctl_node password 'h4ckm3';"
+
+* Feature: The ability to set the replication password to create a secondary from a primary (which internally is done via pg_basebackup)  in the pg_autoctl create monitor command itself.
+	-> will remove the need to: "pg_autoctl config set replication.password h4ckm3m0r3" or the need to supply PGPASSWORD/PGPASSFILE to the standby creation command.
+	
+	-> Besides supplying PGPASSWORD/PGPASSFILE in PG land is a drop-in replacement to the password in a connection string. So there is potential for confusion among users as to what PGPASSWORD really means. Does it refer to the replication password or the monitor connection password or both?
+
+* Issue/Docs: Setting the replication.password entry w/ "config set" does not set the password in the database's catalog.
+	-> we have to do it explicitly with an "alter user pgautofailover_replicator password 'h4ckm3m0r3'"
+	-> Right now the internal command: `pg_autoctl do primary adduser` is supposed to add the replication user w/ the supplied password. However, replication.username can only be done after
+	the create postgres command is run, making this a chicken and egg problem.
+
+* Feature: If using any password based authentication scheme, we should not have to specify --no-ssl.
+	-> auth -> md5|scram|password => there is no ssl
+	-> Investigate: There could be ssl for purely encryption purposes.
+
+* Feature: Consistency in password defaults. (replication pass and monitor pass dont have defaults but the health-check password does)
+	- Is there any vulnerability wrt the health-check user..can it go do crazy things in other databases?
+
+* Feature: Configurable log format and fields.
+	-> Log fields should be configurable
+	-> JSON/CSV/raw text
+
+* Docs/Feature: auth=trust: Generation of the common name (CN) is based on the FQDN of the host and it may exceed the 64 character limit for OpenSSL.
+	-> Failing faster is best w/ a nice error message
+	-> Limitation should be documented.
+
+* Monitor/primary/mirror started at the same time. Default (maybe) timeout is too relaxed.\
+
+* What does a reasonable backup of the monitor look like?
+	- Are we expected to take backups of the monitor?
+
+* autoctl run does not daemonize
+
+* Docs: PGCONNECT_TIMEOUT
+
+* warning: cannot parse node port :5432
+
+* Verbosity -> log level does not affect WARNING messages (does not show line number).
+
+* Logging: We should log DEBUG at least configuration changes. (config set)
+
+* Drop formation needs to drop the nodes. There was a foreign key problem. (1.3.1)
+
+* Issue: pivotal@station4:~/workspace/pg_auto_failover$ pg_autoctl stop node --pgdata ~/failover/monitor/
+16:25:38 14040 ERROR Failed to get value for environment variable 'PGDATA', which is unset
+16:25:38 14040 FATAL Failed to set PGDATA either from the environment or from --pgdata
+pivotal@station4:~/workspace/pg_auto_failover$ PGDATA=~/failover/monitor pg_autoctl stop node #works
+
+* Burning question: How would password based auth fare when there is a failover?
+(Maybe replication.password is going to come into play when there is a failover?)
+
+* Feature: make uninstall - Switching b/w autofailover versions is a pain because make install did not overwrite the extension installation files.
+
+* Issue: Mysterious FATAL in server log: unrecognized recovery parameter "track_functions" while creating a secondary w/ server version REL11_9 w/ master (does not repro w/ REL13 of the server)
+
+* Issue: Isn't it a big concern that we store the password in the config file? (the result of setting replication.password)

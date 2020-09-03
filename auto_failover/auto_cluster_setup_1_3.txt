@@ -1,0 +1,30 @@
+# Dev setup
+
+## Postgres
+cd ~/workspace/postgres && git checkout REL_11_9
+make distclean
+git clean -fd
+make -j16 -s && make install -s
+make -C contrib/pg_stat_statements/ install -s
+make -C contrib/btree_gist install -s
+
+## pg_auto_failover
+cd ~/workspace/pg_auto_failover && git checkout v1.3.1
+make clean -s
+git clean -fd
+make -j16 -s && make install -s
+rm $(pg_config --libdir)/pgautofailover.so
+
+# Cluster startup
+
+## Cleanup XDG dirs created by autofailover
+rm -rf ~/failover/* ~/.local/share/pg_autoctl ~/.config/pg_autoctl /run/user/$(id -u $(whoami))/pg_autoctl
+
+# Monitor
+PG_AUTOCTL_DEBUG=1 pg_autoctl create monitor --pgport 7800 --auth trust --pgdata /home/pivotal/failover/monitor -v --no-ssl --nodename 127.0.0.1 --run
+
+# Primary
+PG_AUTOCTL_DEBUG=1 pg_autoctl create postgres --pgdata /home/pivotal/failover/primary --pgport=8800 --monitor postgres://autoctl_node@127.0.0.1:7800/pg_auto_failover?sslmode=prefer --auth trust --no-ssl --nodename 127.0.0.1 --run
+
+# Secondary
+PG_AUTOCTL_DEBUG=1 pg_autoctl create postgres --pgdata /home/pivotal/failover/secondary --pgport=9800 --monitor postgres://autoctl_node@127.0.0.1:7800/pg_auto_failover?sslmode=prefer --auth trust --no-ssl --nodename 127.0.0.1 --run
