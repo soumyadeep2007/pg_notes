@@ -1,0 +1,22 @@
+IC notes for refactoring:
+
+1. CTS: aggressiveRetry -> TCP -> maybe we can move it to the CTSE?
+2. MotionConn
+3. CTSE:
+
+
+
+
+PR review:
+
+1. FWD dec not necessary: typedef struct ICProxyConn ICProxyConn;
+2. Use MAXHOSTNAMELEN (param.h) instead of HOST_NAME_MAX as HOST_NAME_MAX is not available in limits.h in MacOS.
+3. Hardcoded path name: ic_proxy_build_server_sock_path
+	
+
+
+
+Qs:
+
+Why are we not using domain socket as opposed to TCP on the same host?
+We can even do TLS over domain socket

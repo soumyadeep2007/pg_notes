@@ -254,7 +254,7 @@ zedstoream_handler.c
 
 * ZedStoreProjectData
 	- project_columns // bitmap set, NULL => need all the columns
-	- proj_attrs // attnos including 0.
+	- proj_attrs // attnos being projected including 0 for meta-attribute.
 	- ZSTidTreeScan tid_scan
 	- ZSAttrTreeScan *attr_scans
 	- cur_range_start
@@ -325,7 +325,7 @@ zedstoream_handler.c
 	- Clear the slot and init to all nulls
 	- Fetch the next visible tid: zsbt_tid_scan_next(scan->scan_proj->tid_scan, direction)
 	- Fetch the datums of each attribute for the fetched tid in a loop over all attributes.
-		- Use zsbt_attr_fetch(attrscan, datum, isnull, zstid) to fetch the datum. If the result of the call is false, then we know the attr value is missing and then we call zsbt_fill_missing_attribute_value().
+		- Use zsbt_attr_fetch(attrscan, datum, isnull, zstid) to fetch the datum. If the result of the call is false, then we know the attr value is missing and then we call zsbt_fill_missing_attribute_value(). Populate "slot"'s tts_values and tts_isnull at the appropriate index for each attribute projected.
 		- TOAST specific stuff
 		- UNDO specific stuff
 

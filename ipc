@@ -1,0 +1,52 @@
+Barriers:
+
+* Participants can be static/dynamic.
+	- If static, the phase number is not used by client code typically as the
+		phase can only advance once all statically determined participants have
+		reached the barrier.
+
+		- Eg of static case.
+			Consider phases A, B, C. and 4 participants
+
+			Each participant works on phase A -> BarrierArriveAndWait() -> each
+				participant works on phase B -> BarrierArriveAndWait() -> ..
+
+				perform_a();
+				BarrierArriveAndWait();
+				perform_b();
+				BarrierArriveAndWait();
+				perform_c();
+
+	- If dynamic, phase #s are used to track progress of each participant and
+		are used to sync with the current phase of a multi-phase algorithm.
+			-- # participants are inited to 0.
+
+			-- # participants may change as participants attach/detach.
+
+			-- A check of what phase the participant should be in must be
+				conducted immediately after the participant attaches to the barrier.
+
+			-- After this the flow of control proceeds just like the static case.
+
+		- Eg of dynamic case:
+			phase = BarrierAttach(&barrier);
+			switch (phase)
+			{
+				case PHASE_A:
+					perform_a();
+					BarrierArriveAndWait(&barrier, ...);
+				case PHASE_B:
+					perform_b();
+					BarrierArriveAndWait(&barrier, ...);
+				case PHASE_C:
+					perform_c();
+					BarrierArriveAndWait(&barrier, ...);
+			}
+			BarrierDetach(&barrier);
+
+* BarrierPhase() -> returns the current phase of the barrier.
+
+* BarrierAttach() -> Once a participant attaches to a barrier, all subsequent
+	invocations of BarrierArriveAndWait() will have to wait on this participant.
+	It also returns the current phase.
+

@@ -336,6 +336,110 @@
 
 * JITed expression evaluation:
 
+* struct ExprContext: Context info for evaluating an expression (for tuple quals/projections).
+	- It is used for instance when we want to fetch an attribute from an inner tuple while evaluating an expression, we have to look at the inner tuple.
+
+	- It has two memory contexts: a per-query memory context and a per-tuple memory context.
+
+	- ecxt_scantuple
+
+	- ecxt_innertuple
+
+	- ecxt_outertuple
+
+	- It is placed in EState->es_exprcontexts upon creation.
+
+* Tuple representations:
+	- MinimalTuple:
+		-- Has no system columns
+
+		-- Used inside the executor, specially to save memory.
+
+		-- Used when tuple rowtype is known.
+
+		-- The representation is chosen so that tuple access routines can work with either full or minimal tuples via a HeapTupleData pointer structure. The access routines see no difference, except that they must not access the transaction status or t_ctid fields because those aren't there.
+
+		-- That said, MinimalTuples should be accessed by slot accessors to avoid accessing system columns by mistake.
+
+		struct MinimalTupleData
+		{
+			uint32		t_len;			/* actual length of minimal tuple */
+
+			char		mt_padding[MINIMAL_TUPLE_PADDING];
+
+			/* Fields below here must match HeapTupleHeaderData! */
+
+			uint16		t_infomask2;	/* number of attributes + various flags */
+
+			uint16		t_infomask;		/* various flag bits, see below */
+
+			uint8		t_hoff;			/* sizeof header incl. bitmap, padding */
+
+			/* ^ - 23 bytes - ^ */
+
+			bits8		t_bits[FLEXIBLE_ARRAY_MEMBER];	/* bitmap of NULLs */
+
+			/* MORE DATA FOLLOWS AT END OF STRUCT */
+		};
+
+		-- A MinimalTuple is really a (HeapTuple - {tableOid, ctid, tx storage}). So you could always reach into the HeapTuple at a certain offset and cast to a MinimalTuple.
+
+	- HeapTuple:
+		typedef struct HeapTupleData
+		{
+			uint32		t_len;			/* length of *t_data */
+			ItemPointerData t_self;		/* SelfItemPointer */
+			Oid			t_tableOid;		/* table the tuple came from */
+		#define FIELDNO_HEAPTUPLEDATA_DATA 3
+			HeapTupleHeader t_data;		/* -> tuple header and data */
+		} HeapTupleData;
+
+		struct HeapTupleHeaderData
+		{
+			union
+			{
+				HeapTupleFields t_heap; // Tx storage
+				DatumTupleFields t_datum;
+			}			t_choice;
+
+			ItemPointerData t_ctid;		/* current TID of this or newer tuple (or a
+										 * speculative insertion token) */
+
+			/* Fields below here must match MinimalTupleData! */
+
+		#define FIELDNO_HEAPTUPLEHEADERDATA_INFOMASK2 2
+			uint16		t_infomask2;	/* number of attributes + various flags */
+
+		#define FIELDNO_HEAPTUPLEHEADERDATA_INFOMASK 3
+			uint16		t_infomask;		/* various flag bits, see below */
+
+		#define FIELDNO_HEAPTUPLEHEADERDATA_HOFF 4
+			uint8		t_hoff;			/* sizeof header incl. bitmap, padding */
+
+			/* ^ - 23 bytes - ^ */
+
+		#define FIELDNO_HEAPTUPLEHEADERDATA_BITS 5
+			bits8		t_bits[FLEXIBLE_ARRAY_MEMBER];	/* bitmap of NULLs */
+
+			/* MORE DATA FOLLOWS AT END OF STRUCT */
+		};
+
+		typedef struct HeapTupleFields
+		{
+			TransactionId t_xmin;		/* inserting xact ID */
+			TransactionId t_xmax;		/* deleting or locking xact ID */
+
+			union
+			{
+				CommandId	t_cid;		/* inserting or deleting command ID, or both */
+				TransactionId t_xvac;	/* old-style VACUUM FULL xact ID */
+			}			t_field3;
+		} HeapTupleFields;
+
+* EPQ:
+	- EvalPlanQual():  Check the updated version of a tuple to see if we want to process it under READ COMMITTED rules.
+
+
 
 
 

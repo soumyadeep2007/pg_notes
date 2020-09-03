@@ -1,0 +1,18 @@
+* RelOptInfo - Per-relation information for planning/optimization
+	pages, tuples, attr_needed....
+
+* PathTarget - This struct contains what we need to know during planning about
+	the tlist that a Path is supposed to compute.
+		- list of exprs to be computed..
+		- sort stuff
+		- total cost of evaling exprs
+		- ..
+
+* RestrictInfo - represents a AND sub-clause of a restriction condition in
+	WHERE, JOIN ON etc.
+
+* RangeTblEntry - Represents a relation or an intermediate relation.
+	- This is where we stick the scanCols in.
+
+	
+

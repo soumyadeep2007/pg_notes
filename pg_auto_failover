@@ -1,0 +1,180 @@
+* There is a separate monitor node.
+	- Runs a state m/c
+
+	- Runs a periodic health check, which is successful when a libpq connection
+		can be made (much like the pg_isready command).
+
+	- Detects when secondary lags behind
+		(pgautofailover.promote_wal_log_threshold setting on the monitor) or
+		is unreachable and automatically removes secondary from synchronous_standby_names.
+
+	- Prevents switch-over/fail-over until the downed secondary is restored.
+
+	- A single monitor can manage >=1 Postgres formations ("contains" groups of
+		primary-secondary pairs). Since the three nodes comprise a Postgresql
+		"service", a formation is a logical set of such services.
+
+	- Data nodes periodically connect with the monitor and run:
+		SELECT pgautofailover.node_active(…)
+		in order to communicate their current state and obtain their goal state.
+		The pgautofailover.node table is updated to store the subsequent state
+		of the data node.
+
+	- The monitor usually changes it's state and waits for the data nodes to
+		converge on a goal state (unless there is some failure)
+
+	- A node is considered unhealthy if the monitor can't connect to it and it
+		hasn't reported it's state through node_active() for a while.
+
+	- Inspecting monitor GUCs:
+			SELECT name, setting
+		    FROM pg_settings
+		   WHERE name ~ 'pgautofailover\.health';
+		                  name                   | setting
+		-----------------------------------------+---------
+		 pgautofailover.health_check_max_retries | 2
+		 pgautofailover.health_check_period      | 20000
+		 pgautofailover.health_check_retry_delay | 2000
+		 pgautofailover.health_check_timeout     | 5000
+		(4 rows)
+
+* Resilience: Resilient to tolerate a failure on any of the 3 nodes.
+	- If the monitor node fails, there is little impact on the system, especially
+		with respect to replication. However, now the system cannot react to
+		failures -> no failover, switchover, sync->async etc.
+
+* Replication: Synchronous under normal operation. When secondary fails,
+	asynchronous replication prevails.
+
+	- There are two states for a primary: "wait_primary", "primary"
+
+	- In the wait_primary state, syncrep can be disabled by setting
+		synchronous_standby_names = ''
+		This will allow writes to proceed. This can be used when the secondary
+		is too far behind and we don't want writes to block while it is still
+		catching up. Failover will be disabled in such a scenario.
+
+	- In the wait_primary state, syncrep can be re-enabled simply by resetting
+		synchronous_standby_names = '*' if the standby is responding to health
+		checks and is withing 1 WAL segment of the primary (configurable)
+		This may of course cause a latency spike.
+
+	- If we want to disable syncrep altogether, we would have to set
+		synchronous_commit = 'local'
+
+
+* Keeper process: 
+	- Runs on primary/secondary and keeps monitor informed about
+		any local changes.
+		-- Eg. WAL delta (collected from pg_stat_replication)
+
+	- Accepts commands from monitor.
+
+	- Controls the host Postgres instance
+		-- pg_ctl
+
+		-- SQL commands
+
+	- Maintains local state of comm with peer and monitor.
+		-- Allows for detection of n/w partitions among other things.
+
+	- The local information, along with the keeper's local state is sent to the
+		Monitor, which along with it's health check information, computes the
+		goal state for a keeper and sends the assignment to it.
+
+* A standby in a Postgres "service" is always considered a hot standby.
+
+* A node is a server (virtual/physical) that runs a Postgres instance and keeper.
+
+* pg_autoctl runs necessary commands for configuring streaming replication b/w
+	primary and secondary. It also runs on the monitor node.
+
+* Components:
+	- pgautofailover extension
+
+	- Monitor Postgres service
+
+	- pg_auto_failover keeper to operate Postgres instances.
+
+* Setting up:
+	- pg_autoctl create monitor --pgdata /path/to/pgdata
+		where we have a pgdata dir for a running Postgres cluster.
+
+		pg_autoctl will do the necessary hostname resolution using forward/reverse
+		DNS queries. (hostname resolution can be overriden using --hostname)
+
+		It will also create an autoctl user and database, along with an autoctl_node
+		user for the other nodes to use. The extension pgautofailover is installed
+		in the created database (pg_auto_failover).
+
+		Background workers are started immediately and they wait for a Postgres
+		node to get registered for health checks.
+
+	- Get connection string for monitor:
+		pg_autoctl show uri --pgdata /path/to/pgdata
+
+	- Install and start a primary:
+		i) pg_autoctl create postgres --pgdata /path/to/pgdata \
+			--monitor postgres://autoctl_node@host/pg_auto_failover
+
+			Again, the hostname of the primary will be automatically determined by
+			pg_autoctl. (hostname resolution can be overriden using --hostname)
+
+			--hostname can also be used to specify an IP address.
+
+			The hostname will be used by pg_autoctl to grant connection privileges
+			in pg_hba.conf.
+
+			If the pgdata dir does not exist, initdb will be run by pg_autoctl.
+
+			The state of the registered primary will be SINGLE.
+
+		ii) pg_autoctl run --pgdata /path/to/pgdata
+
+			This will start the keeper service which will connect to the monitor
+			every 5s.
+
+	- Install and start a secondary:
+		i) pg_autoctl create postgres --pgdata /path/to/pgdata \
+					--monitor postgres://autoctl_node@host/pg_auto_failover
+
+			This is the same as before. Only now, this command is being run while
+			the monitor already has a node registered. The first node ever
+			registered is the primary and any subsequent node(s) will be treated
+			as secondaries.
+
+			The command will not return until:
+				a) pg_hba.conf for primary is modified with the replication
+					privilege.
+				b) replication slot is created on the primary for the secondary.
+
+			The monitor will assign the goal state CATCHINGUP to the secondary
+			and then the secondary can be created with a pg_basebackup from
+			the primary, then install recovery.conf and start the Postgres service.
+
+		ii) pg_autoctl run --pgdata /path/to/pgdata
+
+			This will start the keeper service.
+
+	- Setup client connections to both primary and secondary with both hostnames
+		/ IP addresses in the client connection string. This ensures that the
+		application can connect to the promoted standby in the event of a failover.
+
+* Note: Even though pg_auto_failover can be "installed" on an already installed
+	PG primary, but it can't be currently "installed" on an already running
+	secondary.
+
+* Node recovery: When bringing back a downed primary after failover, the keeper
+	can simply be restarted w/ pg_autoctl run.
+		1. It will restart Postgres, if needed.
+
+		2. It will obtain it's goal state from the monitor.
+
+		3. Then it will run pg_rewind to make itself a secondary. If it is too
+			far behind, it will establish itself as a secondary w/ a pg_basebackup.
+
+
+
+
+
+ 

@@ -1,0 +1,119 @@
+shm_mq.c: Single-reader, Single-writer shared memory message queue
+
+* Both the sender and the receiver must have a PGPROC (per-backend process entry
+	in shmem)
+	- The procLatch for both the sender and receiver are used for sync.
+
+	- Only the sender may send and the receiver receive.
+
+	- Allows communtication between a user backend and it's registered worker
+		backends.
+
+* struct shm_mq - Shared memory message queue representation
+	- PGPROC *mq_receiver and pg_atomic_uint64 mq_bytes_read can only be changed
+		by the receiver.
+
+	- PGPROC *mq_sender and pg_atomic_uint64 mq_bytes_written can only be changed
+		by the sender.
+
+	- mq_receiver and mq_sender are protected by mq_mutex. However, since they
+		cannot be changed after they are set, it is fine to read them w/o a lock.
+
+	- char mq_ring[FLEXIBLE_ARRAY_MEMBER] - Holds the actual data.
+		-- It can be safely read/written w/o a lock.
+
+		-- At any given time, (mq_bytes_written - mq_bytes_read) represents the
+			unread data that is present in the ring, starting at mq_bytes_read.
+
+		-- The sender can increase the number of unread bytes at any time (by
+			increasing mq_bytes_written).
+
+		-- The receiver can only decrease the number of unread bytes by advancing
+			mq_bytes_read. Advancing mq_bytes_read also enables reuse of the buffer.
+				--- This means that the receiver can safely, w/o a lock, read
+					the unread bytes.
+
+				--- Conversely, the sender can write to the unused portion of the
+					buffer w/o a lock.
+
+				--- It is unsafe for the receiver to re-read data that it has
+					already marked as "read" (by advancing the pointer).
+
+				--- It is unsafe for the receiver to write any data.
+
+				--- It is unsafe for the sender to re-read any data after
+					incrementing mq_bytes_written. There is no use case for this.
+
+	- mq_bytes_read and mq_bytes_written are not protected by the mutex. Instead,
+		they are written atomically using 8 byte loads and stores. 
+		-- Memory barriers must be carefully used to synchronize reads and writes
+			of these values with reads and writes of the actual data in mq_ring.
+
+	- mq_detached needs no locks.
+
+	- mq_ring_size and mq_ring_offset also don't change after init and thus need
+		no lock for reads.
+
+* struct shm_mq_handle - A backend private handle to a shm_mq
+	- mqh_queue - Pointer to the shm_mq.
+
+	- mqh_segment - (Optional) Pointer to the DSM segment housing mqh_queue.
+
+	- mqh_handle - If we want to make a queue that connects the current process
+		w/ a background worker, the user can pass a pointer to the worker's
+		handle into shm_mq_attach(), which we will store here.
+		-- The reason why we do this is because we can send to the queue even
+			before the receiver has started.
+			--- If the receiver fails to start, the handle will allow us to detect
+				that and fail gracefully, avoiding infinite waits.
+
+	- When a message exists as a contiguous chunk in the ring buffer (i.e. w/o
+		wrap-around), we return the message to the caller as a pointer into the
+		buffer.
+
+	- char *mqh_buffer, Size mqh_buflen - When a message exists w/ wrap-around
+		or is larger than the buffer, we reassemble the message by locally
+		copying the chunks into a backend-local buffer.
+
+	- mqh_partial_bytes, mqh_expected_bytes, and mqh_length_word_complete are
+		used to track the state of non-blocking operations.
+
+	- ..
+
+* shm_mq_receive(handle, *nbytesp, **datap, nowait flag)
+	- We set *nbytes to the message length and *data to point to the message
+ 		payload
+
+ 	- If the entire message exists in the queue as a single, contiguous chunk,
+ 		*data will point directly into shared memory; otherwise, it will point
+ 		to a temporary buffer.
+ 		-- This mostly avoids data copying in the hoped-for case where messages
+ 			are short compared to the buffer size, while still allowing longer
+ 			messages.  In either case, the return value remains valid until the
+ 			next receive operation is performed on the queue.
+
+ 	- When nowait is false, we will wait on our process latch when the ring
+ 		buffer is empty. The sender will set our process latch after more data
+ 		has been written, and we'll resume processing. Each call will therefore
+ 		return a complete message (unless the sender detaches the queue).
+
+ 	- When nowait = true, we do not manipulate the state of the process latch;
+		instead, whenever the buffer is empty and we need to read from it, we
+		return SHM_MQ_WOULD_BLOCK.  In this case, the caller should call this
+		function again after the process latch has been set.
+
+tqueue.c: A tuple queue to send and receive tuples between parallel backends.
+
+* A DestReceiver of type DestTupleQueue, which is a TQueueDestReceiver
+under the hood, writes tuples from the executor to a shm_mq.
+
+* A TupleQueueReader (a glorified shm_mq_handle) reads tuples from a shm_mq
+	and returns the tuples.
+
+* tqueueReceiveSlot(slot, DestReceiver *self) - Receive a tuple from the slot
+	supplied and then send it to the designated shm_mq (self).
+	- Extract a heap tuple from the slot.
+
+	- Send the tuple using shm_mq_send().
+
+* TupleQueueReaderNext(reader, 

@@ -1,0 +1,29 @@
+* Checkpoints are dispatched at intervals.
+
+* Checkpointer is started as soon as startup subprocess completes and recovery
+	begins. (reaper sets PM_RUN from PM_STARTUP and then ServerLoop() can start
+	checkpointer (StartupCheckpointer())).
+
+* Checkpointer remains alive until the postmaster commands it to terminate (by
+	SIGUSR2). Upon receiving a termination request, it executes a shutdown
+	checkpoint. All backends must be stopped before a SIGUSR2 is sent to the
+	checkpointer.
+
+* If there is an emergency, the checkpointer would receive a SIGQUIT and simply
+	abort (like any  other backend).
+
+* Checkpointer crash = any other backend crash..corruped shmem possible..info
+	lost about which files need to be fsynced..all backends should be killed by
+	SIGQUIT in such a scenario and recovery cycle should be started.
+
+* Checkpointer loop has a HandleCheckpointerInterrupts() which does a ShutdownXLOG() -> {
+	WalSndInitStopping(), WalSndWaitStopping();
+	CreateCheckPoint(CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_IMMEDIATE);
+	...
+}
+
+* During startup, if we encounter a shutdown checkpoint, then we know for sure
+	that nothing was running on the primary at this point.
+
+* There is also an end-of-recovery checkpoint, which is a shutdown checkpoint
+	that is issued at the end of recovery..

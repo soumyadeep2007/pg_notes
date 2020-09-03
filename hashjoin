@@ -1,0 +1,89 @@
+* Parallel oblivious - node unaware that it is part of a parallel exec.
+
+* Parallel aware: Appears as "Parallel Hash Join" in EXPLAIN along with a
+	"Parallel Hash" node.
+	- Behaves differently w/ backends coordinating work b/w backends.
+
+	- Uses the same per-backend state m/c as parallel-ob.
+
+	- There is a global state m/c as well with which local backends sync their
+		program counters and their local state m/cs. This global m/c is managed
+		w/ barriers.
+
+	- When a participant starts, it has to figure out what work it has to do.
+
+	- build_barrier: coordinates the hashing phases.
+		-- PHJ_BUILD_ELECTING: Initial state
+			Set up shared state for coordinating batches
+
+			Allocate batch 0's hash table in shmem.
+
+		-- PHJ_BUILD_ALLOCATING: Batches and "table 0" (?) setup. (1 worker)
+
+		-- PHJ_BUILD_HASHING_INNER: Hash the inner rel. (all workers)
+			--- When a participant joins this phase, it will either hash tuples
+				or it will have to complete any effort to increase the #batches/
+				#buckets first (if such an operation is underway).
+
+			--- If there is batch growing work to be done
+				ExecParallelHashIncreaseNumBatches() is called:
+				> Attach to grow_batches_barrier.
+
+			--- May involve circular sub-phases (won't be necessary if planner
+			got the number of batches/buckets right):
+				> PHJ_GROW_BATCHES_ELECTING: initial state
+
+				> PHJ_GROW_BATCHES_ALLOCATING: new batch allocation (1 worker)
+
+				> PHJ_GROW_BATCHES_REPARTITIONING: (all workers)
+
+				> PHJ_GROW_BATCHES_FINISHING: Clean up and skew detection (1 worker)
+
+
+				> PHJ_GROW_BUCKETS_ELECTING: Initial state (1 worker)
+					Preparation to grow the number of batches => reallocating/
+					resetting buckets of batch 0.
+
+				> PHJ_GROW_BUCKETS_ALLOCATING: New buckets allocated (1 worker)
+
+				> PHJ_GROW_BUCKETS_REINSERTING: Insert tuples (all workers)
+
+		-- PHJ_BUILD_HASHING_OUTER: Hash the outer rel (1 worker) (only for
+			multi-batch)
+
+		-- PHJ_BUILD_DONE: Building complete, probing can now begin.
+
+	- After build is complete, backends split up and process different batches
+		and/or work together on probing batches if #batches_left < #backends.
+		-- For each batch, there is a separate barrier with the phases:
+			> PHJ_BATCH_ELECTING: Initial state
+
+			> PHJ_BATCH_ALLOCATING: Allocate buckets (1 worker)
+
+			> PHJ_BATCH_LOADING: Load hash table from disk (all workers)
+
+			> PHJ_BATCH_PROBING: (all workers)
+
+			> PHJ_BATCH_DONE: End state
+
+		-- Batch 0 is special. It's hash table was already built during
+			PHJ_BUILD_HASHING_INNER. So it can start directly at PHJ_BATCH_PROBING.
+
+	- General hash join phases (ExecHashJoin state m/c)
+		-- HJ_BUILD_HASHTABLE - Builds HT for inner rel.
+			--- ExecHashTableCreate(): Creates empty hash table
+				> A hash table size is chosen.
+
+				> If there is parallelism, we attach to the build barrier and
+					execute PHJ_GROW_BATCHES_ELECTING.
+
+			--- MultiExecProcNode() -> MultiExecHash() -> MultiExecParallelHash()
+				This builds the hash table.
+				> Syncs with build_barrier to go through the other PHJ_BUILD_*
+					phases.
+
+
+
+
+
+

@@ -1,0 +1,296 @@
+* Virtual disk: Appears to be a single physical disk but maybe constructed from multiple physical
+disks.
+
+* I/O request: Defined as (r/w, start_pos, num_bytes)
+
+* I/O latency: Time for an I/O operation across the OS stack and not just the device level.
+
+* Disks have an I/O queue in-built.
+	- Queueing could be elevator-based (rotational) or separate r/w queues (SSD)
+
+* Disks can have an on-disk cache (DRAM). It can be used as a write-back cache to improve writes.
+
+*      idle time   I/O Req    wait time                service time      I/O completion
+  |<----------------->|<---------------------->|<------------------------->|
+                                        response time
+                      |<---------------------------------------------------|
+
+	- service time excludes the time to wait in the I/O queue (wait time)
+
+	- All of the above times depend on the location from whuch they are measured.
+		-- In an OS context, service time may be measured as the time from when an I/O request was
+			issued to the disk device to the time when the completion interrupt occured. It will
+			exclude time waiting in the OS queues and reflects only the overall performance of the
+			disk device. The metric that includes the time spent waiting in the OS queues is the
+			request time.
+
+		-- In a disk context, service time refers to the time (fig above)
+
+		-- Main takeaway: We have to be careful how each metric is defined, and in context to what
+			as each layer in the storage stack can have varied queueing schemes.
+
+* To get near about the max disk performance cap of a device, we can use the dd command to take a
+	given file and output it to /dev/null. dd will tell us the speed.
+
+* iostat average latency will not distinguish between on-disk cache hits and misses!
+
+* Note that the disk offsets as seen from the operating system may not match the offsets on the
+	physical disk. 
+	- For example, a hardware-provided virtual disk may map a contiguous range of offsets
+	across multiple disks.
+
+	- Disks may remap offsets in their own way (via the disk data controller).
+
+	- Sometimes random I/O isn’t identified by inspecting the offsets but may be inferred by measuring
+	increased service time.
+
+* I/O sizes:
+	- Larger I/O sizes typically provide higher throughput, although for longer per-I/O latency!!!
+
+	- The I/O size may be altered by the disk device subsystem (for example, quantized to 512-byte
+		blocks).
+
+	- The size may also have been inflated and deflated since the I/O was issued at the application
+		level, by kernel components such as file systems, volume managers, and device drivers.
+
+	- Some disk devices, especially flash-based, perform very differently with different read and
+		write sizes. For example, a flash-based disk drive may perform optimally with 4 Kbyte reads
+		and 1 Mbyte writes.
+
+* From the above 2 points, we can see that an I/O request or set of requests can be altered by any
+	or all of the subsystems involved under the application layer.
+
+* Non-Data-Transfer Disk Commands - Commands such as flush-on-disk-cache can also end up utilizing
+	the disk at the expense of queued requests.
+
+* High disk-util may signal that something is wrong. Or it might be that the requests are async,
+	which means that the application is not blocked on the I/O maxing out the disk.
+
+* Virtual disks are a beast to monitor!
+	- Virtual disks that include a write-back cache may not appear very busy during write workloads,
+		since the disk controller returns write completions immediately, despite the underlying
+		disks being busy sometime afterward.
+
+	- A virtual disk that is 100% busy, and is built upon multiple physical disks, may be able to
+		accept more work. In this case, 100% may mean that some disks were busy all the time, but
+		not all the disks all the time, and therefore some disks were idle.
+
+* Interval summaries CAN BE MISLEADING!! A disk at 50% util over an interval could have been 100%
+	utilized half of the time and completely idle for the remainder of the time.
+	- This is why I/O event tracing is so important.
+
+* Rule of thumb: A disk w/ above 60% utilization can be characterized as a busy disk.
+	- Requests made repeatedly to a disk which has 100% utilization may cause queuing load (which
+		might even lead to re-requests, since the queues can hold only so much)
+
+* Linux block device interface: Has a buffer cache and I/O is requested in blocks.
+	- Buffer cache is used less these days thanks to FS voodoo. One may bypass the buffer cache -
+		direct I/O.
+
+	- Linux block layer : additional OS level augmentation at the block device interface.
+		-- Elevator layer - Elevator seeking algorithm to reduce rotational head travel by sorting
+			requests based on location and methods to merge/coalesce requests.
+			--- This is where the I/O scheduler kicks in..ordering/reordering requests for optimal
+				delivery.
+
+			--- After the I/O scheduler is done, the I/O requests are placed on the block device
+				queue.
+
+	- iostat monitors this interface.
+		--- rrqm/s: Read requests that are merged per/s before being placed in the DRIVER's request
+			queue.
+
+		--- wrqm/s: Similar to the above.
+
+		--- rrqm/s and wrqm/s if high, signify a sequential workload.
+
+		--- r/s: Read requests issued to the driver request queue.
+
+		--- avgrq-sz: After-merge request size.
+
+		--- aqu-sz: avg #requests waiting in the driver request queue.
+
+		--- await: avg I/O response time (as diagrammed above)
+
+		--- One call also see IOPS (I/O requests per second) (tps: transactions/s)
+
+* DTrace: Can be used to trace disk I/O events within the kernel.
+	- Events such as block device interface I/O events, I/O scheduler events, target and device
+		driver I/O events.
+
+	- Frequency distribution one-liner: 
+
+		dtrace -n 'io:::start { @[execname] = quantize(args[0]->b_bcount); }' //b_bcount = I/O size in bytes
+
+		tar
+		value  ------------- Distribution ------------- count
+		  2048 |                                         0
+		  4096 |                                         1
+		  8192 |                                         0
+		 16384 |                                         0
+		 32768 |                                         0
+		 65536 |@@@@                                     13
+		131072 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@     121
+		262144 |                                         0
+
+	- (*) There is a handy disk seek size Dtrace script (diskseeksize.d in the Systems Performance book)
+		that shows the disk seek distribution, shows the seek distance (in blocks) between the last
+		I/O's last sector and the current I/O's beginning sector. Seeks of mostly 0 blocks indicate
+		a sequential workload.
+
+			3   fsflush
+			 value  ------------- Distribution ------------- count
+			     2 |                                         0
+			     4 |@                                        2
+			     8 |                                         0
+			    16 |@@@@@                                    15
+			    32 |                                         0
+			    64 |                                         0
+			   128 |                                         0
+			   256 |                                         0
+			   512 |                                         0
+			  1024 |                                         0
+			  2048 |                                         0
+			  4096 |                                         0
+			  8192 |                                         0
+			 16384 |@@@@@@@@@                                24
+			 32768 |@@@@                                     13
+			 65536 |@@@@@                                    15
+			131072 |@@@@@@@@@@@@                             34
+			262144 |@@@                                      9
+			524288 |                                         0
+
+	- disklatency.d: Latency distribution for devices by request size.
+
+		  block I/O latency (ns)
+		   value  ------------- Distribution ------------- count
+		    2048 |                                         0
+		    4096 |                                         26
+		    8192 |                                         0
+		   16384 |                                         4
+		   32768 |@@@@                                     227
+		   65536 |@@@@@@@@@@@@@@@@@                        1047
+		  131072 |@@@@@@@@@@@@@                            797
+		  262144 |@@@@                                     220
+		  524288 |@@                                       125
+		 1048576 |@                                        40
+		 2097152 |                                         18
+		 4194304 |                                         0
+		 8388608 |                                         0
+		16777216 |                                         1
+		33554432 |                                         0
+
+	- biolatency BPF script:
+		-- Tracing block device I/O... Hit Ctrl-C to end.
+
+			usecs               : count      distribution
+			    0 -> 1          : 0        |                                        |
+			    2 -> 3          : 0        |                                        |
+			    4 -> 7          : 0        |                                        |
+			    8 -> 15         : 0        |                                        |
+			   16 -> 31         : 0        |                                        |
+			   32 -> 63         : 0        |                                        |
+			   64 -> 127        : 15       |                                        |
+			  128 -> 255        : 4475     |************                            |
+			  256 -> 511        : 14222    |****************************************|
+			  512 -> 1023       : 12303    |**********************************      |
+			 1024 -> 2047       : 5649     |***************                         |
+			 2048 -> 4095       : 995      |**                                      |
+			 4096 -> 8191       : 1980     |*****                                   |
+			 8192 -> 16383      : 3681     |**********                              |
+			16384 -> 32767      : 1895     |*****                                   |
+			32768 -> 65535      : 721      |**                                      |
+			65536 -> 131071     : 394      |*                                       |
+			31072 -> 262143     : 65       |                                        |
+			62144 -> 524287     : 17       |                                        |
+
+		-- There is also a flag (-D) that will display the o/p disk by disk.
+
+		-- There is a flag (-F) which will display the o/p by (rwbs) type.
+
+* iotop: It is a version of top that shows disk read/s and other good stuff per pid.
+
+* rwbs kernel type that is exposed by BPF tools:
+	R: Read
+	W: Write
+	M: Metadata
+	S: Synchronous
+	(*)A: Read-ahead
+	F: Flush or force unit access
+	D: Discard
+	E: Erase
+	N: None
+
+* I/O Schedulers:
+	- Nowadays, we have multi-queue scheduling, one q/processor to avoid a single bottleneck q.
+
+	- Multi-queue schedulers available:
+		-- None: No queueing
+
+		-- BFQ: Budget fair queueing, similar to CFQ
+
+		-- mq-deadline
+
+* biopattern: It is a BPFTrace tool which identifies the randomness of the I/O pattern.
+
+			# biopattern.bt
+		Attaching 4 probes...
+		TIME      %RND  %SEQ    COUNT     KBYTES
+		00:05:54    83    16     2960      13312
+		00:05:55    82    17     3881      15524
+		00:05:56    78    21     3059      12232
+		00:05:57    73    26     2770      14204
+		00:05:58     0   100        1          0
+		00:05:59     0     0        0          0
+		00:06:00     0    99     1536     196360
+		00:06:01     0   100    13444    1720704
+		00:06:02     0    99    13864    1771876
+		00:06:03     0   100    13129    1680640
+		00:06:04     0    99    13532    1731484
+		[...]
+
+* iosched: Traces the time requests were queued for in the I/O scheduler's queues:
+	# iosched.bt
+	Attaching 5 probes...
+		Tracing block I/O schedulers. Hit Ctrl-C to end.
+		^C
+
+		@usecs[cfq]:
+		[2, 4)                 1 |                                                    |
+		[4, 8)                 3 |@                                                   |
+		[8, 16)               18 |@@@@@@@                                             |
+		[16, 32)               6 |@@                                                  |
+		[32, 64)               0 |                                                    |
+		[64, 128)              0 |                                                    |
+		[128, 256)             0 |                                                    |
+		[256, 512)             0 |                                                    |
+		[512, 1K)              6 |@@                                                  |
+		[1K, 2K)               8 |@@@                                                 |
+		[2K, 4K)               0 |                                                    |
+		[4K, 8K)               0 |                                                    |
+		[8K, 16K)             28 |@@@@@@@@@@@                                         |
+		[16K, 32K)           131 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+		[32K, 64K)            68 |@@@@@@@@@@@@@@@@@@@@@@@@@@                          |
+
+* Distribution of I/O types:
+	# bpftrace -e 't:block:block_rq_issue { @[args->rwbs] = count(); }'
+		Attaching 1 probe...
+		^C
+
+		@[N]: 2
+		@[WFS]: 9
+		@[FF]: 12
+		@[N]: 13
+		@[WSM]: 23
+		@[WM]: 64
+		@[WS]: 86
+		@[R]: 201
+		@[R]: 285
+		@[W]: 459
+		@[RM]: 1112
+		@[RA]: 2128
+		@[R]: 3635
+		@[W]: 4578
+
+* # Trace all block completions, all types of writes, until Ctrl-C:
+perf record -e block:block_rq_complete --filter 'rwbs ~ "*W*"'
