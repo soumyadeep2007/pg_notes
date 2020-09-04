@@ -55,6 +55,4 @@ pivotal@station4:~/workspace/pg_auto_failover$ PGDATA=~/failover/monitor pg_auto
 
 * Feature: make uninstall - Switching b/w autofailover versions is a pain because make install did not overwrite the extension installation files.
 
-* Issue: Mysterious FATAL in server log: unrecognized recovery parameter "track_functions" while creating a secondary w/ server version REL11_9 w/ master (does not repro w/ REL13 of the server)
-
 * Issue: Isn't it a big concern that we store the password in the config file? (the result of setting replication.password)
