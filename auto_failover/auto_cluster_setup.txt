@@ -18,6 +18,7 @@ PG_AUTOCTL_DEBUG=1 pg_autoctl create postgres --pgdata /home/pivotal/failover/se
 
 PG_AUTOCTL_DEBUG=1 pg_autoctl run --pgdata ~/failover/secondary --pgport 9800
 
+-----------------------------------------------------------
 
 ## Straightforward cluster setup w/ password based (md5/scram-sha-256) authentication
 
