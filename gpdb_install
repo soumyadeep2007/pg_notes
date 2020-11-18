@@ -1,0 +1,18 @@
+# gpdb5 on Ubuntu 20
+
+gpdb5 (PG 8.3) has old perl syntax that turns array bases to 1 from 0
+in parse.pl (perl removed support for this from v5.30)
+
+So we need to build perl from source and wire it to gpdb
+
+wget https://www.cpan.org/src/5.0/perl-5.28.3.tar.gz
+mkdir ~/perl
+cd perl-5.28.3
+./Configure -des -Dprefix=$HOME/perl -Accflags=-fPIC
+# -fPIC supplied to avoid gpdb5 make complaint:
+# relocation R_X86_64_PC32 against symbol `PL_compcv' can not be used when making a shared object
+make -j16 -s && make install -s
+
+# configure gpdb5 like this: PERL=$HOME/perl/bin/perl ./configure ...
+
+
