@@ -68,7 +68,7 @@ HA, load balancing and replication, backup and restore:
 			all the WAL since the last base backup).
 
 			Instead of continuously archiving the WAL files, we could stream the WAL
-			files over to another server that borne out of the same base backup. The
+			files over to another server that was borne out of the same base backup. The
 			result is a warm standby.
 
 	- WAL archiving setup: -- WAL records are grouped into segment files (of
@@ -170,7 +170,9 @@ HA, load balancing and replication, backup and restore:
 			target to indicate how to recover and how much to recover.. Typically,
 			the restore command is a cp command with a special format..described
 			below)
-			Also, create recovery.signal in datadir.
+			Also, create recovery.signal in datadir. (Create a standby.signal
+			if we wanted the recovering server to stay as a standby at the end
+			of recovery..i.e. continuous recovery from the archive)
 
 		8. Prevent users from connecting to the database while the database is
 			recovering by temporarily updating pg_hba.conf
@@ -350,7 +352,7 @@ table level.
 
 		-- Cascading replication: master -> standby (C) -> standby.
 
-			--- Minimzes connectivity to the master.
+			--- Minimizes connectivity to the master.
 
 	- Sync rep for streaming replication:
 		-- Allows for confirmation to a tx that all standbys have
@@ -377,3 +379,254 @@ table level.
 
 	- To recover the old primary, 
 
+* Archiver process (PG 12):
+	- Forked from the postmaster
+
+	- #define PGARCH_AUTOWAKE_INTERVAL 60 /* How often to force a poll of the
+									 * archive status directory; in seconds. */
+	  #define PGARCH_RESTART_INTERVAL 10	/* How often to attempt to restart a
+									 * failed archiver; in seconds. */
+	- /*
+	   * Maximum number of retries allowed when attempting to archive a WAL
+	   * file.
+	   */
+	  #define NUM_ARCHIVE_RETRIES 3
+
+	- /*
+	   * Maximum number of retries allowed when attempting to remove an
+	   * orphan archive status file.
+	   */
+	  #define NUM_ORPHAN_CLEANUP_RETRIES 3
+
+	- Handles signals:
+		pqsignal(SIGHUP, ArchSigHupHandler);
+		pqsignal(SIGTERM, ArchSigTermHandler);
+		pqsignal(SIGQUIT, pgarch_exit);
+		pqsignal(SIGUSR1, pgarch_waken);
+		pqsignal(SIGUSR2, pgarch_waken_stop);
+
+	- pgarch_MainLoop()
+	{
+		do
+		{
+			/* signal handling */
+
+			pgarch_ArchiverCopyLoop();
+
+			/* sleep until signal forces a wakeup */
+		} while(!time_to_stop()) // quit if told (SIGUSR2) or Postmaster death
+	}
+
+	- pgarch_ArchiverCopyLoop()
+	{
+		/*
+		 * invoked when its time to wakeup, or on SIGUSR2 when we do one last
+		 * archive cycle and exit.
+		 */
+		char		xlog[MAX_XFN_CHARS + 1];
+		while (pgarch_readyXlog(xlog))
+		{
+			/* signal handling */
+
+			/* remove orphaned .ready status files (otherwise chaos!) */
+
+			if(pgarch_archiveXlog(xlog))
+			{
+				/* wal file successfully archived */
+				pgarch_archiveDone(xlog); /* marks a .ready file as .done */
+				pgstat_send_archiver(xlog, false);
+			}
+			else
+			{
+				// failure
+				pgstat_send_archiver(xlog, true);
+				if (++failures >= NUM_ARCHIVE_RETRIES)
+				{
+					...
+					return;		/* give up archiving for now */
+				}
+				pg_usleep(1000000L); /* sleep a sec before retrying */
+			}
+		}
+	}
+
+
+	- pgarch_readyXlog() - Returns name of the oldest xlog file that has not yet
+	been archived (oldest file that has an archive status of .ready in the
+	archive_status dir)
+		-- Returning the oldest is important because the older an xlog file gets,
+		the more the probability of it becoming recycled. Besides, we want to
+		preserve the sequence of WAL, to make replay logic easier on the other
+		side.
+
+		-- The oldest comparsion considers .history files as older than any
+		other file except another .history file.
+
+		-- The oldest comparison also accounts for timelines. This implies that
+		older timelines are given precedence for archiving. This may or may not
+		be ideal.
+
+
+	- pgarch_archiveXlog(xlog)
+	{
+		/* '%' placeholder substitution in archive_command */
+
+		/*
+		 * Invoke system() to call archive command and react to status code.
+		 *
+		 * Note that if archive_command failed or was terminated by a signal,
+		 * the archiver process is aborted. This is okay, since the postmaster
+		 * can always respawn us.
+		 * 
+		 * Reacting to the status code also involves setting the ps display.
+		 */
+	}
+
+* Startup recovery process (startup.c):
+	- Forked from the postmaster
+
+	- Handles signals:
+
+		pqsignal(SIGHUP, StartupProcSigHupHandler); /* reload config file */
+		pqsignal(SIGTERM, StartupProcShutdownHandler);	/* request shutdown */
+		pqsignal(SIGQUIT, startupproc_quickdie);	/* hard crash time */
+		pqsignal(SIGUSR1, StartupProcSigUsr1Handler);
+		pqsignal(SIGUSR2, StartupProcTriggerHandler);
+
+	- StartupXLOG() -- updates pg_control for easy restartability!
+	{
+		/* verify XLOG status by reading control file db state. */
+
+		/*
+		 * Incredibly neat: XLOG_REPLAY_DELAY
+		 * allows attachment of a debugger!
+		 */
+
+		/* Determine recovery target by consulting control file. */
+
+		/* 
+		 * Check for presence of standby|recovery.signal and set globals:
+		 * ArchiveRecoveryRequested: T if standby|recovery.signal were present
+		 * StandbyModeRequested = T, if standby.signal was found, F otherwise
+		 */
+		readRecoverySignalFile();
+
+		validateRecoveryParameters();
+
+		if (read_backup_label(&checkPointLoc, &backupEndRequired,
+					  &backupFromStandby))
+	  	{
+	  		/* Recovery will start from the ckpt listed in the backup_label file. */
+	  	}
+	  	else
+	  	{
+	  		/*
+	  		 * Strategy: replay WAL in pg_wal first and then look at archive if
+	  		 * archive recovery was requested (determined by looking at
+	  		 * pg_control)..
+	  		 */
+
+	  		/* Recovery will start from the last valid checkpoint (pg_control).	*/
+	  	}
+
+	  	/* Sanity check that checkpoint record is in expected timeline. */
+
+  		/* Rel cache invalidation */
+
+  		/* Shared memory initialization */
+
+			/* REDO */
+		if (InRecovery)
+		{
+			/* This means that we have considered recovery as necessary. */
+
+			/*
+			 * Update control file to indicate that we have started recovery
+			 * and our start location (checkpoint record)
+		 	 *
+			 * Also grab recovery target info, if any
+			 */
+
+			/* Nuke pg_stat* data */
+
+			/* Delete backup_label if any (all it's data is now in pg_control) */
+
+			CheckRequiredParameterValues(); // ensure GUC settings allow recovery
+
+			/* Init for HS */
+			if (ArchiveRecoveryRequested && EnableHotStandby)
+			{
+				/* 
+				 * Backends won't be allowed until min recovery point is reached
+				 * as specified in the control file and a recovery snapshot has
+				 * been established from a running-xacts WAL record.
+				 */
+				 InitRecoveryTransactionEnvironment();
+
+				 /* more startup.. */
+			}
+
+			/* Init shared variables (XLogCtl) for WAL progress tracking. */
+
+			/*
+			 * Let postmaster know that we have started redo, so it can start
+			 * checkpointer, so that it can perform restart points.
+			 */
+
+			/*
+			 * Check if we have already reached a consistent point.
+			 * If yes, signal PM that it can start accepting connections while
+			 * updating the control file.
+			 *
+			 * Note if we are in crash recovery, this will early exit, as in
+			 * crash recovery all the WAL has to be played.
+			 */
+			CheckRecoveryConsistency();
+		}
+
+		/* Read next WAL record and start main recovery loop. *
+		do
+		{
+			/* Handle interrupts */
+
+			/* Pause WAL recovery if requested by a pg_wal_replay_pause() */
+
+			/* If we have reached the recovery target, set reachedStopPoint */
+
+			/*
+			 * Switch current timeline if current record being replayed causes
+			 * a switch (XLOG_CHECKPOINT_SHUTDOWN, XLOG_END_OF_RECOVERY).
+			 */
+
+		 	/* Replay WAL record */
+			RmgrTable[record->xl_rmid].rm_redo(xlogreader);
+
+			/* Update progress variables in XLogCtl */
+
+			/* 
+			 * If there was a timeline switch, clean up any xlog files from the
+			 * older timeline in pg_wal. !!!!!
+			 */
+			RemoveNonParentXlogFiles(EndRecPtr, ThisTimeLineID);
+
+			/* For ReadRecord details: see WaitForWALToBecomeAvailable()
+			record = ReadRecord(xlogreader, InvalidXLogRecPtr, LOG, false);
+		} while (record != NULL)
+
+		if(reachedStopPoint)
+		{
+			/*
+			 * Take recovery action: shutdown, pause, promote.
+			 */
+
+			/* cleanup */
+		}
+
+		ShutdownWalRcv();
+
+	}
+
+	- WaitForWALToBecomeAvailable()
+	{
+		
+	}
